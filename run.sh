@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the SBL demo scenario. Builds first if out/sbl.jar is missing.
+# Starts the SBL core (no dummy data; see seed.sh). Builds first if out/sbl.jar is missing.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

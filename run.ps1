@@ -1,4 +1,4 @@
-# Runs the SBL demo scenario. Builds first if out\sbl.jar is missing.
+# Starts the SBL core (no dummy data; see seed.ps1). Builds first if out\sbl.jar is missing.
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 $tool = Join-Path $repo ".tooling"

@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Sets up a local JVM + Kotlin toolchain into .tooling/ using the XYZ internal
-# Artifactory (reachable without proxy) plus the corporate CA certificate.
+# Artifactory plus the corporate CA certificate.
 # Only needed on machines without a system JDK/Gradle. Idempotent.
 #
 # Environment overrides:
 #   SBL_CA_CERT  path to the corporate CA certificate. If unset, curl uses the
 #                system trust store (set this on locked-down corporate machines).
 #   SBL_PYTHON   python interpreter used to fetch jdk4py (default: python3).
+#   SBL_ART_HOST Artifactory host (default: repository.saas.cagip.group.gca).
+#   SBL_PROXY    force a proxy for the internal Artifactory, e.g.
+#                http://user:pass@proxy.host:8080. By default the Artifactory
+#                host is reached directly even if HTTPS_PROXY is set, because
+#                the corporate proxy re-signs TLS and pip rejects it.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,13 +21,27 @@ LIBS="$TOOL/libs"
 mkdir -p "$KLIB" "$LIBS" "$TOOL/py"
 
 CA="${SBL_CA_CERT:-}"
-M="https://repository.saas.cagip.group.gca/artifactory/maven-remote"
+ART_HOST="${SBL_ART_HOST:-repository.saas.cagip.group.gca}"
+M="https://$ART_HOST/artifactory/maven-remote"
 PY="${SBL_PYTHON:-python3}"
 KV="2.0.21"
 
+PROXY="${SBL_PROXY:-}"
+
 CURL_OPTS=(-s --max-time 180)
+PIP_OPTS=()
 if [ -n "$CA" ]; then
   CURL_OPTS+=(--cacert "$CA")
+  PIP_OPTS+=(--cert "$CA")
+fi
+if [ -n "$PROXY" ]; then
+  echo "Using proxy $(echo "$PROXY" | sed -E 's#//[^@/]+@#//***@#')"
+  CURL_OPTS+=(--proxy "$PROXY")
+  PIP_OPTS+=(--proxy "$PROXY")
+else
+  echo "Bypassing proxy for $ART_HOST"
+  CURL_OPTS+=(--noproxy "$ART_HOST")
+  export NO_PROXY="${NO_PROXY:+$NO_PROXY,}$ART_HOST" no_proxy="${no_proxy:+$no_proxy,}$ART_HOST"
 fi
 
 get_jar() {
@@ -43,7 +62,7 @@ get_jar() {
 echo "1) JDK 21 (jdk4py) via internal PyPI ..."
 if [ ! -e "$TOOL/py/jdk4py/java-runtime/bin/java" ] && \
    ! find "$TOOL/py/jdk4py" -type f -name java >/dev/null 2>&1; then
-  "$PY" -m pip install --no-input --disable-pip-version-check "jdk4py==21.0.8.2" --target "$TOOL/py"
+  "$PY" -m pip install --no-input --disable-pip-version-check ${PIP_OPTS[@]+"${PIP_OPTS[@]}"} "jdk4py==21.0.8.2" --target "$TOOL/py"
 else
   echo "  cached jdk4py"
 fi

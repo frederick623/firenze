@@ -1,5 +1,12 @@
 package com.piscessoft.sbl
 
+import com.piscessoft.sbl.api.ApiKeyAuth
+import com.piscessoft.sbl.api.ApiServer
+import com.piscessoft.sbl.api.Json
+import com.piscessoft.sbl.api.Principal
+import com.piscessoft.sbl.api.Role
+import com.piscessoft.sbl.api.SblApi
+import com.piscessoft.sbl.app.SblServices
 import com.piscessoft.sbl.db.Database
 import com.piscessoft.sbl.model.*
 import com.piscessoft.sbl.repo.*
@@ -9,6 +16,10 @@ import com.piscessoft.sbl.util.Money
 import com.piscessoft.sbl.util.SblTime
 import java.io.File
 import java.math.BigDecimal
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.time.LocalDate
 
 /**
@@ -55,6 +66,7 @@ object SblTests {
             testSprsThresholdAndCsv()
             testIrdClassification()
             testAuditAppendOnly()
+            testRestApi()
         } finally {
             SblTime.resetToSystem()
         }
@@ -466,6 +478,88 @@ object SblTests {
         val history = c.audit.history("CONTRACT", "X1")
         check("history returns the entry", history.size == 1 && history.first().eventType == "TEST_EVENT")
         c.db.close()
+    }
+
+    // ---- REST API ----
+
+    private fun testRestApi() {
+        section("API REST endpoints")
+        val c = newCtx(); SblTime.freezeAt(D0)
+        c.seedParties(); c.seedSecurity("00700", 9_000_000_000, SecurityType.EQTY)
+        c.price("00700", "300.00"); c.seedDefaultRate("0.005")
+        c.inventory.onPositionSettled("L1", "00700", AccountType.PROPRIETARY, 1_000_000)
+
+        val opKey = ApiKeyAuth.randomKey()
+        val b1Key = ApiKeyAuth.randomKey()
+        val b2Key = ApiKeyAuth.randomKey()
+        val auth = ApiKeyAuth.of(
+            opKey to Principal("ops", Role.OPERATOR, null),
+            b1Key to Principal("b1", Role.USER, "B1"),
+            b2Key to Principal("b2", Role.USER, "B2"))
+        val services = SblServices(c.db)
+        val server = ApiServer(c.db, services.audit, auth, SblApi(services).routes())
+        val port = server.start("127.0.0.1", 0).port
+        val http = HttpClient.newBuilder().proxy(HttpClient.Builder.NO_PROXY).build()
+
+        fun call(method: String, path: String, key: String?, body: String? = null,
+                 contentType: String = "application/json"): Pair<Int, Any?> {
+            val b = HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/api/v1$path"))
+            if (key != null) b.header("X-API-Key", key)
+            if (body != null) b.header("Content-Type", contentType)
+            b.method(method, body?.let { HttpRequest.BodyPublishers.ofString(it) } ?: HttpRequest.BodyPublishers.noBody())
+            val r = http.send(b.build(), HttpResponse.BodyHandlers.ofString())
+            return r.statusCode() to r.body().takeIf { it.isNotBlank() }?.let { Json.parse(it) }
+        }
+        fun Any?.f(key: String): Any? = (this as? Map<*, *>)?.get(key)
+
+        try {
+            check("health is public", call("GET", "/health", null).first == 200)
+            check("missing key -> 401", call("GET", "/me", null).first == 401)
+            check("unknown key -> 401", call("GET", "/me", ApiKeyAuth.randomKey()).first == 401)
+            check("/me returns caller", call("GET", "/me", b1Key).second.f("counterpartyId") == "B1")
+            check("user on operator endpoint -> 403", call("GET", "/counterparties", b1Key).first == 403)
+            check("unknown path -> 404", call("GET", "/nope", opKey).first == 404)
+            check("wrong method -> 405", call("DELETE", "/locates", b1Key).first == 405)
+            check("malformed JSON -> 400", call("POST", "/locates", b1Key, "{oops").first == 400)
+            check("non-JSON body -> 415", call("POST", "/locates", b1Key, "x", "text/plain").first == 415)
+            check("missing field -> 400", call("POST", "/locates", b1Key, """{"stockCode":"00700"}""").first == 400)
+
+            // Booking flow as borrower B1: locate -> contract -> collateral.
+            check("user cannot act for another borrower -> 403", call("POST", "/locates", b1Key,
+                """{"borrowerId":"B2","stockCode":"00700","quantity":100000}""").first == 403)
+            val (ls, decision) = call("POST", "/locates", b1Key, """{"stockCode":"00700","quantity":100000}""")
+            check("locate created (201)", ls == 201)
+            check("locate approved", decision.f("outcome") == "APPROVED")
+            check("locate booked for caller", decision.f("locate").f("borrowerId") == "B1")
+            val locateId = decision.f("locate").f("locateId") as String
+
+            check("other user cannot book on B1's locate", call("POST", "/contracts", b2Key,
+                """{"locateId":"$locateId","lenderId":"L1"}""").first == 404)
+            val (cs, contract) = call("POST", "/contracts", b1Key, """{"locateId":"$locateId","lenderId":"L1"}""")
+            check("contract opened (201)", cs == 201)
+            val contractId = contract.f("contractId") as String
+            check("contract hidden from other user", call("GET", "/contracts/$contractId", b2Key).first == 404)
+            check("owner sees contract", call("GET", "/contracts/$contractId", b1Key).first == 200)
+            check("contract list scoped to caller",
+                (call("GET", "/contracts", b1Key).second as List<*>).size == 1 &&
+                (call("GET", "/contracts", b2Key).second as List<*>).isEmpty())
+
+            check("unknown collateral type -> 422", call("POST", "/contracts/$contractId/collateral", b1Key,
+                """{"collateralType":"GOLD","assetId":"X","quantity":1,"unitPrice":1}""").first == 422)
+            val (ps, _) = call("POST", "/contracts/$contractId/collateral", b1Key,
+                """{"collateralType":"CASH_HKD","assetId":"HKD","quantity":40000000,"unitPrice":1}""")
+            check("collateral posted (201)", ps == 201)
+            check("collateral listed", (call("GET", "/contracts/$contractId/collateral", b1Key).second as List<*>).size == 1)
+
+            check("user cannot run EOD -> 403", call("POST", "/operations/eod", b1Key).first == 403)
+            val (es, eod) = call("POST", "/operations/eod", opKey)
+            check("operator EOD runs", es == 200 && eod.f("contractsValued") != null)
+            check("API calls are audited",
+                services.audit.history("API", "POST /api/v1/locates").any { it.actorId == "b1" })
+        } finally {
+            server.stop()
+            c.db.close()
+        }
     }
 
     private fun section(title: String) = println("\n[$title]")
