@@ -3,9 +3,11 @@ package com.piscessoft.sbl.app
 import com.piscessoft.sbl.db.Database
 import com.piscessoft.sbl.db.DbConnectionConfig
 import com.piscessoft.sbl.db.DbConnector
+import com.piscessoft.sbl.model.SettlementMode
 import com.piscessoft.sbl.repo.*
 import com.piscessoft.sbl.service.*
 import java.io.File
+import java.math.BigDecimal
 
 /**
  * Opens the SBL database from CLI flags / environment variables. Shared by the system
@@ -86,11 +88,19 @@ object DbBootstrap {
     }
 }
 
-/** Wires repositories and the eight business-module services on top of a [Database]. */
-class SblServices(val db: Database) {
+/**
+ * Wires repositories and the business-module services on top of a [Database].
+ * [settlementMode] defaults to env SBL_SETTLEMENT_MODE (AUTO | EXTERNAL), else AUTO.
+ */
+class SblServices(
+    val db: Database,
+    settlementMode: SettlementMode = System.getenv("SBL_SETTLEMENT_MODE")
+        ?.let { SettlementMode.valueOf(it.trim().uppercase()) } ?: SettlementMode.AUTO
+) {
     val audit = AuditService(AuditRepo(db))
     val market = MarketDataRepo(db)
     val contracts = ContractRepo(db)
+    val settlementLegs = SettlementLegRepo(db)
     val counterparties = CounterpartyRepo(db)
     val sblas = SblaRepo(db)
     val designatedSecurities = DesignatedSecurityRepo(db)
@@ -98,9 +108,11 @@ class SblServices(val db: Database) {
     val marginCalls = MarginCallRepo(db)
 
     val inventory: InventoryService
+    val allocationSvc: AllocationService
     val locateSvc: LocateService
     val contractSvc: ContractService
     val collateralSvc: CollateralService
+    val settlementSvc: SettlementService
     val feeSvc: FeeService
     val caSvc: CorporateActionService
     val reportingSvc: ReportingService
@@ -126,13 +138,22 @@ class SblServices(val db: Database) {
         val irdRepo = IrdRepo(db)
         val cap571xRepo = Cap571xRepo(db)
 
-        inventory = InventoryService(positionRepo, locateRepo, contracts, snapshotRepo, designatedSecurities, audit)
+        allocationSvc = AllocationService(ContractAllocationRepo(db), positionRepo, contracts, counterparties,
+            recallRepo, settlementLegs, market, audit,
+            defaultFeeSharePct = System.getenv("SBL_DEFAULT_CLIENT_FEE_SHARE")?.trim()?.toBigDecimal()
+                ?: BigDecimal("0.50"))
+        inventory = InventoryService(positionRepo, locateRepo, contracts, snapshotRepo, designatedSecurities, audit, allocationSvc)
         locateSvc = LocateService(locateRepo, counterparties, sblas, designatedSecurities, rateSchedules, market,
             assuranceRepo, contracts, inventory, audit)
         contractSvc = ContractService(contracts, eventRepo, recallRepo, rateHistoryRepo, counterparties,
-            assuranceRepo, locateSvc, locateRepo, inventory, audit)
-        collateralSvc = CollateralService(collateralRepo, marginCalls, mtmRepo, contracts, configRepo, market, audit)
-        feeSvc = FeeService(accrualRepo, splitRepo, statementRepo, contracts, market, rateHistoryRepo, audit)
+            assuranceRepo, locateSvc, locateRepo, inventory, settlementLegs, allocationSvc, audit)
+        inventory.positionListener = { contractSvc.onSourcePositionChanged(it) }
+        collateralSvc = CollateralService(collateralRepo, marginCalls, mtmRepo, ContractMtmHistoryRepo(db), contracts,
+            configRepo, market, audit, designatedSecurities, positionRepo, counterparties)
+        settlementSvc = SettlementService(settlementLegs, contracts, contractSvc, collateralSvc, audit, settlementMode)
+        feeSvc = FeeService(accrualRepo, splitRepo, statementRepo, contracts, market, rateHistoryRepo, audit,
+            settlementLegs, allocationSvc, RebateAccrualRepo(db), collateralRepo, configRepo, counterparties,
+            defaultRebateSpreadBps = System.getenv("SBL_DEFAULT_REBATE_SPREAD_BPS")?.trim()?.toInt() ?: 25)
         caSvc = CorporateActionService(caEventRepo, caImpactRepo, contracts, contractSvc, market, audit)
         reportingSvc = ReportingService(contracts, designatedSecurities, market, spReportRepo, sprsRepo, irdRepo,
             cap571xRepo, sblas, recallRepo, eventRepo, accrualRepo, audit)

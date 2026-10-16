@@ -11,9 +11,11 @@ import java.sql.ResultSet
 class CounterpartyRepo(private val db: Database) {
     fun insert(c: Counterparty) = db.update(
         """INSERT INTO counterparty (id,name,cp_type,tier,approved_borrower,credit_limit_hkd,
-           fee_settlement_basis,regulated_person,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+           fee_settlement_basis,regulated_person,fee_share_pct,rebate_spread_bps,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         c.id, c.name, c.type.name, c.tier?.name, c.approvedBorrower, Money.toDb(c.creditLimitHkd),
-        c.feeSettlementBasis.name, c.regulatedPerson, SblTime.formatTs(c.createdAt)
+        c.feeSettlementBasis.name, c.regulatedPerson, Money.toDb(c.feeSharePct), c.rebateSpreadBps,
+        SblTime.formatTs(c.createdAt)
     )
 
     fun find(id: String): Counterparty? =
@@ -30,6 +32,8 @@ class CounterpartyRepo(private val db: Database) {
         creditLimitHkd = Money.fromDb(rs.getString("credit_limit_hkd")),
         feeSettlementBasis = FeeSettlementBasis.valueOf(rs.getString("fee_settlement_basis")),
         regulatedPerson = rs.boolean("regulated_person"),
+        feeSharePct = Money.fromDb(rs.getString("fee_share_pct")),
+        rebateSpreadBps = rs.getString("rebate_spread_bps")?.toInt(),
         createdAt = SblTime.parseTs(rs.getString("created_at"))!!
     )
 }
@@ -64,13 +68,13 @@ class SblaRepo(private val db: Database) {
 class DesignatedSecurityRepo(private val db: Database) {
     fun upsert(d: DesignatedSecurity) = db.update(
         """INSERT INTO designated_security (stock_code,stock_name,security_type,issued_shares,
-           eligible,ca_restricted,updated_at) VALUES (?,?,?,?,?,?,?)
+           eligible,ca_restricted,updated_at,issuer_id,currency) VALUES (?,?,?,?,?,?,?,?,?)
            ON CONFLICT(stock_code) DO UPDATE SET stock_name=excluded.stock_name,
            security_type=excluded.security_type, issued_shares=excluded.issued_shares,
            eligible=excluded.eligible, ca_restricted=excluded.ca_restricted,
-           updated_at=excluded.updated_at""",
+           updated_at=excluded.updated_at, issuer_id=excluded.issuer_id, currency=excluded.currency""",
         d.stockCode, d.stockName, d.securityType.name, d.issuedShares,
-        d.eligible, d.caRestricted, SblTime.formatTs(d.updatedAt)
+        d.eligible, d.caRestricted, SblTime.formatTs(d.updatedAt), d.issuerId, d.currency
     )
 
     fun find(stockCode: String): DesignatedSecurity? =
@@ -93,7 +97,9 @@ class DesignatedSecurityRepo(private val db: Database) {
         issuedShares = rs.getLong("issued_shares"),
         eligible = rs.boolean("eligible"),
         caRestricted = rs.boolean("ca_restricted"),
-        updatedAt = SblTime.parseTs(rs.getString("updated_at"))!!
+        updatedAt = SblTime.parseTs(rs.getString("updated_at"))!!,
+        issuerId = rs.getString("issuer_id"),
+        currency = rs.getString("currency") ?: "HKD"
     )
 }
 
@@ -112,7 +118,8 @@ class CollateralTypeConfigRepo(private val db: Database) {
         eligibleGeneral = rs.boolean("eligible_general"),
         eligibleShortSale = rs.boolean("eligible_short_sale"),
         maxConcentration = Money.fromDb(rs.getString("max_concentration")),
-        notes = rs.getString("notes")
+        notes = rs.getString("notes"),
+        nominalValued = rs.boolean("nominal_valued")
     )
 }
 
@@ -122,7 +129,7 @@ class RateScheduleRepo(private val db: Database) {
            floating_index,floating_spread_bps,min_rate,effective_from,effective_to,priority,created_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         r.scheduleId, r.stockCode, r.borrowerTier?.name, r.feeType.name, Money.toDb(r.annualRate),
-        r.floatingIndex, r.floatingSpreadBps, Money.toDb(r.minRate),
+        r.floatingIndex?.name, r.floatingSpreadBps, Money.toDb(r.minRate),
         SblTime.formatDate(r.effectiveFrom), SblTime.formatDate(r.effectiveTo), r.priority,
         SblTime.formatTs(r.createdAt)
     )
@@ -136,7 +143,7 @@ class RateScheduleRepo(private val db: Database) {
         borrowerTier = rs.getString("borrower_tier")?.let { BorrowerTier.valueOf(it) },
         feeType = FeeType.valueOf(rs.getString("fee_type")),
         annualRate = Money.fromDb(rs.getString("annual_rate")),
-        floatingIndex = rs.getString("floating_index"),
+        floatingIndex = rs.getString("floating_index")?.let { FloatingIndex.valueOf(it) },
         floatingSpreadBps = rs.getString("floating_spread_bps")?.toInt(),
         minRate = Money.fromDb(rs.getString("min_rate")),
         effectiveFrom = SblTime.parseDate(rs.getString("effective_from"))!!,
@@ -177,14 +184,22 @@ class MarketDataRepo(private val db: Database) {
             currency, SblTime.formatDate(date)) { BigDecimal(it.getString(1)) } ?: BigDecimal.ONE
     }
 
-    fun putIndex(index: String, date: java.time.LocalDate, rate: BigDecimal) = db.update(
+    /** Latest rate to HKD at or before [date]; null when no rate is on file (never defaults to 1). */
+    fun fxOrNull(currency: String, date: java.time.LocalDate): BigDecimal? {
+        if (currency == "HKD") return BigDecimal.ONE
+        return db.queryOne("""SELECT rate_to_hkd FROM fx_rate WHERE currency=? AND rate_date<=?
+                              ORDER BY rate_date DESC LIMIT 1""",
+            currency, SblTime.formatDate(date)) { BigDecimal(it.getString(1)) }
+    }
+
+    fun putIndex(index: FloatingIndex, date: java.time.LocalDate, rate: BigDecimal) = db.update(
         """INSERT INTO floating_index (index_name,rate_date,annual_rate) VALUES (?,?,?)
            ON CONFLICT(index_name,rate_date) DO UPDATE SET annual_rate=excluded.annual_rate""",
-        index, SblTime.formatDate(date), Money.toDb(rate)
+        index.name, SblTime.formatDate(date), Money.toDb(rate)
     )
 
-    fun index(index: String, date: java.time.LocalDate): BigDecimal? =
+    fun index(index: FloatingIndex, date: java.time.LocalDate): BigDecimal? =
         db.queryOne("""SELECT annual_rate FROM floating_index WHERE index_name=? AND rate_date<=?
                        ORDER BY rate_date DESC LIMIT 1""",
-            index, SblTime.formatDate(date)) { BigDecimal(it.getString(1)) }
+            index.name, SblTime.formatDate(date)) { BigDecimal(it.getString(1)) }
 }

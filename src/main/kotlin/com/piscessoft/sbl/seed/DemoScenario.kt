@@ -21,6 +21,7 @@ class DemoScenario(private val s: SblServices) {
     private val locateSvc = s.locateSvc
     private val contractSvc = s.contractSvc
     private val collateralSvc = s.collateralSvc
+    private val settlementSvc = s.settlementSvc
     private val feeSvc = s.feeSvc
     private val caSvc = s.caSvc
     private val reportingSvc = s.reportingSvc
@@ -39,27 +40,32 @@ class DemoScenario(private val s: SblServices) {
         // Demonstrate limit-driven partial fill on the hot stock for another borrower.
         demoLocate("B2", "00700", 3_000_000)
 
-        // ---- Module 4: Post collateral ----
+        // ---- Module 4: Post collateral to each borrower's account (covers its whole book) ----
         banner("MODULE 4  Collateral Posting")
-        postCash(c1, 45_000_000)
-        postCash(c2, 340_000_000)
-        postCash(c3, 28_000_000)
-        postCash(c4, 10_000_000)
+        postCash("B1", 390_000_000)   // B1 book (c1 + c2 + c4) requires ~386.9m
+        postCash("B2", 28_000_000)    // B2 book (c3) requires 27.3m
 
-        // ---- Daily cycle: fees + MTM ----
+        // ---- Daily cycle: settlement + fees + MTM (nothing accrues until the T+2 open legs settle) ----
         cycle(d0)
         advanceTo(d0.plusDays(1)); cycle(SblTime.today())
 
+        // ---- Settlement: T+2 open legs deliver (collateral already in place) ----
+        banner("SETTLEMENT  T+2 Open Legs")
+        advanceTo(d0.plusDays(2))
+        val run = settlementSvc.settleDue(SblTime.today())
+        run.settled.forEach { println("  ${it.legType} leg ${it.legId.take(8)} contract ${it.contractId.take(8)} x${it.quantity} settled ${it.actualSettleDate}") }
+        run.failed.forEach { println("  ${it.legType} leg ${it.legId.take(8)} FAILED - ${it.failReason}") }
+
         // ---- Module 4: price shock -> margin call ----
         banner("MODULE 4  Price Shock -> Margin Call")
-        advanceTo(d0.plusDays(2))
         market.putPrice("00005", SblTime.today(), Money.of("46.00"))
         val mtm = collateralSvc.runDailyMtm(SblTime.today())
         feeSvc.accrueDaily(SblTime.today())
         mtm.filter { it.marginCall != null }.forEach {
-            println("  Margin call on ${it.contractId.take(8)}: coverage=${it.coverageRatio} deficit=${Money.format(it.marginCall!!.deficitHkd)} HKD")
-            postCash(it.contractId, 6_000_000)
-            val call = s.marginCalls.pendingForContract(it.contractId)
+            println("  Margin call on ${it.counterpartyId} account: required=${Money.format(it.requiredCollateralHkd)} " +
+                "eligible=${Money.format(it.eligibleCollateralHkd)} deficit=${Money.format(it.marginCall!!.deficitHkd)} HKD")
+            postCash(it.counterpartyId, 6_000_000)
+            val call = s.marginCalls.pendingForCounterparty(it.counterpartyId)
             if (call != null) collateralSvc.resolveMarginCall(call.callId, ResolutionMethod.CASH_TOPUP)
             println("  -> topped up & resolved via CASH_TOPUP")
         }
@@ -130,7 +136,8 @@ class DemoScenario(private val s: SblServices) {
         val contract = contractSvc.openFromLocate(
             decision.locate.locateId, lender, agentId = agent, agentSplitPct = agentSplit
         )
-        println("  Contract ${contract.contractId.take(8)} OPEN - ${stock} x${contract.quantity} @ ${contract.feeRate} (${contract.feeType})")
+        println("  Contract ${contract.contractId.take(8)} ${contract.status} - ${stock} x${contract.quantity} @ ${contract.feeRate} (${contract.feeType}), " +
+            "settles ${s.settlementLegs.openLeg(contract.contractId)?.intendedSettleDate}")
         return contract.contractId
     }
 
@@ -140,11 +147,12 @@ class DemoScenario(private val s: SblServices) {
         if (d.outcome != LocateStatus.REJECTED) locateSvc.cancel(d.locate.locateId)
     }
 
-    private fun postCash(contractId: String, amount: Long) {
-        collateralSvc.postCollateral(contractId, "CASH_HKD", "HKD", BigDecimal(amount), BigDecimal.ONE)
+    private fun postCash(counterpartyId: String, amount: Long) {
+        collateralSvc.postCollateral(counterpartyId, "CASH_HKD", "HKD", BigDecimal(amount))
     }
 
     private fun cycle(date: LocalDate) {
+        settlementSvc.settleDue(date)
         feeSvc.accrueDaily(date)
         collateralSvc.runDailyMtm(date)
     }

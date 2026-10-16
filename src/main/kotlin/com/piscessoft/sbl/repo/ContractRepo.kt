@@ -17,18 +17,18 @@ class ContractRepo(private val db: Database) {
            floating_spread_bps,collateral_ratio_required,is_short_sale_borrow,sbla_id,locate_id,
            assurance_id,assurance_basis,agent_split_pct,regulated_person_flag,regulated_person_deadline,
            regulated_person_deployed,regulated_person_purpose,potential_non_exempt,non_exempt_reason,
-           ird_category,cumulative_fee_hkd,version,created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           ird_category,cumulative_fee_hkd,book_side,version,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         c.contractId, c.status.name, c.tradeType.name, c.transactionModel.name, c.lenderId,
         c.borrowerId, c.agentId, c.stockCode, c.quantity, c.quantityReturned, c.quantityOutstanding,
         SblTime.formatDate(c.openDate), SblTime.formatDate(c.closeDate),
         SblTime.formatDate(c.actualCloseDate), Money.toDb(c.feeRate), c.feeType.name,
-        SblTime.formatDate(c.feeRateEffectiveDate), c.floatingIndex, c.floatingSpreadBps,
+        SblTime.formatDate(c.feeRateEffectiveDate), c.floatingIndex?.name, c.floatingSpreadBps,
         Money.toDb(c.collateralRatioRequired), c.isShortSaleBorrow, c.sblaId, c.locateId,
         c.assuranceId, c.assuranceBasis?.name, Money.toDb(c.agentSplitPct), c.regulatedPersonFlag,
         SblTime.formatDate(c.regulatedPersonDeadline), c.regulatedPersonDeployed,
         c.regulatedPersonPurpose, c.potentialNonExempt, c.nonExemptReason, c.irdCategory,
-        Money.toDb(c.cumulativeFeeHkd), c.version, SblTime.formatTs(c.createdAt),
+        Money.toDb(c.cumulativeFeeHkd), c.bookSide.name, c.version, SblTime.formatTs(c.createdAt),
         SblTime.formatTs(c.updatedAt)
     )
 
@@ -54,9 +54,18 @@ class ContractRepo(private val db: Database) {
     fun find(id: String): SblContract? =
         db.queryOne("SELECT * FROM sbl_contract WHERE contract_id=?", id) { map(it) }
 
+    /** Contracts whose OPEN leg has settled and that still have stock on loan. */
     fun active(): List<SblContract> =
         db.query("""SELECT * FROM sbl_contract WHERE status IN
-                    ('ACTIVE','RECALLED','PARTIALLY_RETURNED','RERATED','ROLLED_OVER','CA_ADJUSTED')""") { map(it) }
+                    ('ACTIVE','RECALLED','RETURN_PENDING','PARTIALLY_RETURNED','RERATED','ROLLED_OVER','CA_ADJUSTED')""") { map(it) }
+
+    /** Active contracts plus contracts booked but awaiting OPEN-leg settlement (CONFIRMED). */
+    fun booked(): List<SblContract> =
+        db.query("""SELECT * FROM sbl_contract WHERE status IN
+                    ('CONFIRMED','ACTIVE','RECALLED','RETURN_PENDING','PARTIALLY_RETURNED','RERATED','ROLLED_OVER','CA_ADJUSTED')""") { map(it) }
+
+    fun bookedForStock(stockCode: String): List<SblContract> =
+        booked().filter { it.stockCode == stockCode }
 
     fun byStatus(vararg statuses: ContractStatus): List<SblContract> {
         val ph = statuses.joinToString(",") { "?" }
@@ -69,9 +78,13 @@ class ContractRepo(private val db: Database) {
 
     fun all(): List<SblContract> = db.query("SELECT * FROM sbl_contract") { map(it) }
 
-    /** On-loan quantity for a stock from active contracts. */
+    /** On-loan (loan-out) quantity for a stock, including booked contracts still pending delivery. */
     fun onLoanQty(stockCode: String): Long =
-        active().filter { it.stockCode == stockCode }.sumOf { it.quantityOutstanding }
+        bookedForStock(stockCode).filter { it.bookSide == BookSide.LOAN_OUT }.sumOf { it.quantityOutstanding }
+
+    /** Street borrow-ins for a stock that are booked or active. */
+    fun bookedBorrowIns(stockCode: String): List<SblContract> =
+        bookedForStock(stockCode).filter { it.bookSide == BookSide.BORROW_IN }
 
     private fun map(rs: ResultSet) = SblContract(
         contractId = rs.getString("contract_id"),
@@ -91,7 +104,7 @@ class ContractRepo(private val db: Database) {
         feeRate = BigDecimal(rs.getString("fee_rate")),
         feeType = FeeType.valueOf(rs.getString("fee_type")),
         feeRateEffectiveDate = SblTime.parseDate(rs.getString("fee_rate_effective_date")),
-        floatingIndex = rs.getString("floating_index"),
+        floatingIndex = rs.getString("floating_index")?.let { FloatingIndex.valueOf(it) },
         floatingSpreadBps = rs.getString("floating_spread_bps")?.toInt(),
         collateralRatioRequired = BigDecimal(rs.getString("collateral_ratio_required")),
         isShortSaleBorrow = rs.boolean("is_short_sale_borrow"),
@@ -108,6 +121,7 @@ class ContractRepo(private val db: Database) {
         nonExemptReason = rs.getString("non_exempt_reason"),
         irdCategory = rs.getInt("ird_category"),
         cumulativeFeeHkd = BigDecimal(rs.getString("cumulative_fee_hkd")),
+        bookSide = BookSide.valueOf(rs.getString("book_side")),
         version = rs.getInt("version"),
         createdAt = SblTime.parseTs(rs.getString("created_at"))!!,
         updatedAt = SblTime.parseTs(rs.getString("updated_at"))!!
@@ -142,7 +156,7 @@ class ContractRateHistoryRepo(private val db: Database) {
            floating_index,floating_spread_bps,effective_from,effective_to,reason,created_at)
            VALUES (?,?,?,?,?,?,?,?,?,?)""",
         h.rateHistoryId, h.contractId, h.feeType.name, Money.toDb(h.annualRate),
-        h.floatingIndex, h.floatingSpreadBps, SblTime.formatDate(h.effectiveFrom),
+        h.floatingIndex?.name, h.floatingSpreadBps, SblTime.formatDate(h.effectiveFrom),
         SblTime.formatDate(h.effectiveTo), h.reason, SblTime.formatTs(h.createdAt)
     )
 
@@ -168,7 +182,7 @@ class ContractRateHistoryRepo(private val db: Database) {
         contractId = rs.getString("contract_id"),
         feeType = FeeType.valueOf(rs.getString("fee_type")),
         annualRate = Money.fromDb(rs.getString("annual_rate")),
-        floatingIndex = rs.getString("floating_index"),
+        floatingIndex = rs.getString("floating_index")?.let { FloatingIndex.valueOf(it) },
         floatingSpreadBps = rs.getString("floating_spread_bps")?.toInt(),
         effectiveFrom = SblTime.parseDate(rs.getString("effective_from"))!!,
         effectiveTo = SblTime.parseDate(rs.getString("effective_to")),
@@ -213,5 +227,66 @@ class RecallRepo(private val db: Database) {
         returnedQty = rs.getLong("returned_qty"),
         returnedAt = SblTime.parseTs(rs.getString("returned_at")),
         createdAt = SblTime.parseTs(rs.getString("created_at"))!!
+    )
+}
+
+class SettlementLegRepo(private val db: Database) {
+    fun insert(l: SettlementLeg) = db.update(
+        """INSERT INTO settlement_leg (leg_id,contract_id,leg_type,quantity,trade_date,
+           intended_settle_date,actual_settle_date,status,external_ref,fail_reason,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        l.legId, l.contractId, l.legType.name, l.quantity, SblTime.formatDate(l.tradeDate),
+        SblTime.formatDate(l.intendedSettleDate), SblTime.formatDate(l.actualSettleDate),
+        l.status.name, l.externalRef, l.failReason, SblTime.formatTs(l.createdAt),
+        SblTime.formatTs(l.updatedAt)
+    )
+
+    fun update(l: SettlementLeg) = db.update(
+        """UPDATE settlement_leg SET status=?, actual_settle_date=?, external_ref=?, fail_reason=?,
+           updated_at=? WHERE leg_id=?""",
+        l.status.name, SblTime.formatDate(l.actualSettleDate), l.externalRef, l.failReason,
+        SblTime.formatTs(l.updatedAt), l.legId
+    )
+
+    fun find(id: String): SettlementLeg? =
+        db.queryOne("SELECT * FROM settlement_leg WHERE leg_id=?", id) { map(it) }
+
+    fun findByExternalRef(ref: String): SettlementLeg? =
+        db.queryOne("SELECT * FROM settlement_leg WHERE external_ref=?", ref) { map(it) }
+
+    fun forContract(contractId: String): List<SettlementLeg> =
+        db.query("SELECT * FROM settlement_leg WHERE contract_id=? ORDER BY created_at, leg_id", contractId) { map(it) }
+
+    /** The contract's OPEN (delivery) leg, or null for legacy contracts booked before legs existed. */
+    fun openLeg(contractId: String): SettlementLeg? =
+        db.queryOne("SELECT * FROM settlement_leg WHERE contract_id=? AND leg_type='OPEN'", contractId) { map(it) }
+
+    /** Legs not yet settled (PENDING or FAILED), oldest intended date first. */
+    fun unsettled(): List<SettlementLeg> =
+        db.query("""SELECT * FROM settlement_leg WHERE status IN ('PENDING','FAILED')
+                    ORDER BY intended_settle_date, created_at""") { map(it) }
+
+    fun list(status: LegStatus? = null, intendedOn: LocalDate? = null): List<SettlementLeg> =
+        db.query("""SELECT * FROM settlement_leg ORDER BY intended_settle_date, created_at""") { map(it) }
+            .filter { (status == null || it.status == status) && (intendedOn == null || it.intendedSettleDate == intendedOn) }
+
+    /** Quantity instructed for return but not yet settled. */
+    fun pendingReturnQty(contractId: String): Long =
+        db.queryLong("""SELECT COALESCE(SUM(quantity),0) FROM settlement_leg
+                        WHERE contract_id=? AND leg_type='RETURN' AND status IN ('PENDING','FAILED')""", contractId)
+
+    private fun map(rs: ResultSet) = SettlementLeg(
+        legId = rs.getString("leg_id"),
+        contractId = rs.getString("contract_id"),
+        legType = LegType.valueOf(rs.getString("leg_type")),
+        quantity = rs.getLong("quantity"),
+        tradeDate = SblTime.parseDate(rs.getString("trade_date"))!!,
+        intendedSettleDate = SblTime.parseDate(rs.getString("intended_settle_date"))!!,
+        status = LegStatus.valueOf(rs.getString("status")),
+        actualSettleDate = SblTime.parseDate(rs.getString("actual_settle_date")),
+        externalRef = rs.getString("external_ref"),
+        failReason = rs.getString("fail_reason"),
+        createdAt = SblTime.parseTs(rs.getString("created_at"))!!,
+        updatedAt = SblTime.parseTs(rs.getString("updated_at"))!!
     )
 }

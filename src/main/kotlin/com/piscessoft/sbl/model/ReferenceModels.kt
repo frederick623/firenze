@@ -13,6 +13,10 @@ data class Counterparty(
     val creditLimitHkd: BigDecimal? = null,
     val feeSettlementBasis: FeeSettlementBasis = FeeSettlementBasis.MONTHLY,
     val regulatedPerson: Boolean = false,
+    /** Share of the lending fee passed through when the firm lends this owner's stock (null = global default). */
+    val feeSharePct: BigDecimal? = null,
+    /** Spread (bps) below the cash benchmark paid as rebate on this counterparty's cash collateral (null = default). */
+    val rebateSpreadBps: Int? = null,
     val createdAt: Instant
 )
 
@@ -35,7 +39,11 @@ data class DesignatedSecurity(
     val issuedShares: Long,
     val eligible: Boolean = true,
     val caRestricted: Boolean = false,
-    val updatedAt: Instant
+    val updatedAt: Instant,
+    /** Issuer grouping for wrong-way-risk checks; null = the stock code itself. */
+    val issuerId: String? = null,
+    /** Trading currency of the closing price. */
+    val currency: String = "HKD"
 )
 
 data class CollateralTypeConfig(
@@ -46,7 +54,9 @@ data class CollateralTypeConfig(
     val eligibleGeneral: Boolean,
     val eligibleShortSale: Boolean,
     val maxConcentration: BigDecimal?,
-    val notes: String?
+    val notes: String?,
+    /** Valued at face (cash, guarantees) rather than from a market price. */
+    val nominalValued: Boolean = false
 )
 
 data class RateSchedule(
@@ -55,7 +65,7 @@ data class RateSchedule(
     val borrowerTier: BorrowerTier?,
     val feeType: FeeType,
     val annualRate: BigDecimal?,
-    val floatingIndex: String?,
+    val floatingIndex: FloatingIndex?,
     val floatingSpreadBps: Int?,
     val minRate: BigDecimal?,
     val effectiveFrom: LocalDate,

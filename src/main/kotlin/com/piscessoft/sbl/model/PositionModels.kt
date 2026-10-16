@@ -27,7 +27,9 @@ data class LendablePool(
     val qtyProprietary: Long,
     val qtyClientDisc: Long,
     val qtyLendingPool: Long,
-    val qtyRecalled: Long
+    val qtyRecalled: Long,
+    /** Street borrow-in quantity usable as supply (included in [grossLendable]). */
+    val qtyBorrowedIn: Long = 0
 )
 
 data class LendablePoolSnapshot(

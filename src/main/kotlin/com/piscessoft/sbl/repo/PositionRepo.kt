@@ -29,6 +29,9 @@ class PositionRepo(private val db: Database) {
     fun forStock(stockCode: String): List<Position> =
         db.query("SELECT * FROM position WHERE stock_code=?", stockCode) { map(it) }
 
+    fun forOwner(ownerId: String): List<Position> =
+        db.query("SELECT * FROM position WHERE owner_id=?", ownerId) { map(it) }
+
     /** First position matching owner/stock/account_type (positions are aggregated per key). */
     fun findKey(ownerId: String, stockCode: String, accountType: AccountType): Position? =
         db.queryOne("SELECT * FROM position WHERE owner_id=? AND stock_code=? AND account_type=?",

@@ -25,6 +25,7 @@ class SblApi(private val s: SblServices) {
     private val rateHistory = ContractRateHistoryRepo(s.db)
     private val collateral = CollateralPositionRepo(s.db)
     private val mtmHistory = MtmHistoryRepo(s.db)
+    private val contractMtmHistory = ContractMtmHistoryRepo(s.db)
     private val collateralTypes = CollateralTypeConfigRepo(s.db)
     private val accruals = FeeAccrualRepo(s.db)
     private val statements = FeeStatementRepo(s.db)
@@ -40,6 +41,7 @@ class SblApi(private val s: SblServices) {
         locates()
         contracts()
         collateral()
+        settlement()
         fees()
         corporateActions()
         reporting()
@@ -73,6 +75,9 @@ class SblApi(private val s: SblServices) {
                 creditLimitHkd = c.optDecimal("creditLimitHkd")?.nonNegative("creditLimitHkd"),
                 feeSettlementBasis = c.optEnum<FeeSettlementBasis>("feeSettlementBasis") ?: FeeSettlementBasis.MONTHLY,
                 regulatedPerson = c.optBool("regulatedPerson") ?: false,
+                rebateSpreadBps = c.optInt("rebateSpreadBps")?.also {
+                    if (it !in -10_000..10_000) badRequest("'rebateSpreadBps' must be between -10000 and 10000")
+                },
                 createdAt = SblTime.now()
             )
             s.counterparties.insert(cp)
@@ -116,12 +121,16 @@ class SblApi(private val s: SblServices) {
 
         put("/securities/{stockCode}", Access.OPERATOR) { c ->
             val code = c.path("stockCode").also { requireId("stockCode", it) }
+            val currency = (c.optStr("currency") ?: "HKD").uppercase()
+            if (!Regex("[A-Z]{3}").matches(currency)) badRequest("'currency' must be a 3-letter ISO code")
             s.inventory.upsertDesignatedSecurity(
                 stockCode = code,
                 name = c.str("stockName"),
                 issuedShares = c.long("issuedShares").positive("issuedShares"),
                 securityType = c.optEnum<SecurityType>("securityType") ?: SecurityType.EQTY,
-                eligible = c.optBool("eligible") ?: true
+                eligible = c.optBool("eligible") ?: true,
+                issuerId = c.optStr("issuerId")?.also { requireId("issuerId", it) },
+                currency = currency
             )
             s.designatedSecurities.find(code)
         }
@@ -140,7 +149,7 @@ class SblApi(private val s: SblServices) {
         post("/rate-schedules", Access.OPERATOR) { c ->
             val feeType = c.enumOf<FeeType>("feeType")
             val annualRate = c.optDecimal("annualRate")?.nonNegative("annualRate")
-            val index = c.optStr("floatingIndex")
+            val index = c.optEnum<FloatingIndex>("floatingIndex")
             when (feeType) {
                 FeeType.FLOATING -> if (index == null) badRequest("'floatingIndex' is required for FLOATING")
                 else -> if (annualRate == null) badRequest("'annualRate' is required for $feeType")
@@ -201,7 +210,7 @@ class SblApi(private val s: SblServices) {
         }
 
         put("/market/indices/{index}", Access.OPERATOR) { c ->
-            val index = c.path("index").also { requireId("index", it) }
+            val index = parseEnum<FloatingIndex>("index", c.path("index"))
             val date = c.optDate("date") ?: SblTime.today()
             val rate = c.decimal("rate")
             s.market.putIndex(index, date, rate)
@@ -301,15 +310,24 @@ class SblApi(private val s: SblServices) {
                 if (it.signum() < 0 || it > BigDecimal.ONE) badRequest("'agentSplitPct' must be between 0 and 1")
             }
             if (split != null && agentId == null) badRequest("'agentSplitPct' requires 'agentId'")
+            // Collateral terms are set by the firm, not the borrower; the service enforces the
+            // regulatory floor (1.05 short-sale / 1.00 general) even for operators.
+            val ratio = c.optDecimal("collateralRatio")?.positive("collateralRatio")
+            val shortSale = c.optBool("shortSale") ?: true
+            if ((ratio != null || !shortSale) && !c.principal.isOperator) {
+                forbidden("Only operators may set 'collateralRatio' or 'shortSale'")
+            }
             created(s.contractSvc.openFromLocate(
                 locateId = locate.locateId,
                 lenderId = lenderId,
                 transactionModel = c.optEnum<TransactionModel>("transactionModel") ?: TransactionModel.PRINCIPAL,
                 tradeType = c.optEnum<TradeType>("tradeType") ?: TradeType.FIXED,
                 closeDate = c.optDate("closeDate"),
-                collateralRatio = c.optDecimal("collateralRatio")?.positive("collateralRatio"),
+                collateralRatio = ratio,
                 agentId = agentId,
-                agentSplitPct = split
+                agentSplitPct = split,
+                settlementDate = c.optDate("settlementDate"),
+                shortSale = shortSale
             ))
         }
 
@@ -330,13 +348,23 @@ class SblApi(private val s: SblServices) {
         get("/contracts/{contractId}/events") { c -> events.forContract(c.loadContract().contractId) }
         get("/contracts/{contractId}/recalls") { c -> recalls.forContract(c.loadContract().contractId) }
         get("/contracts/{contractId}/rate-history") { c -> rateHistory.forContract(c.loadContract().contractId) }
+        get("/contracts/{contractId}/legs") { c -> s.settlementLegs.forContract(c.loadContract().contractId) }
 
+        // Instructs a RETURN leg (T+2, or T+0 for internal desks); outstanding falls when it settles.
         post("/contracts/{contractId}/returns") { c ->
             val k = c.borrowerContract()
-            s.contractSvc.processReturn(k.contractId, c.long("quantity").positive("quantity"))
+            val leg = s.contractSvc.instructReturn(k.contractId, c.long("quantity").positive("quantity"),
+                c.optDate("settlementDate"))
+            s.settlementSvc.trySettleNow(k.contractId)
+            created(s.settlementLegs.find(leg.legId))
         }
 
-        post("/contracts/{contractId}/close") { c -> s.contractSvc.close(c.borrowerContract().contractId) }
+        post("/contracts/{contractId}/close") { c ->
+            val k = c.borrowerContract()
+            val leg = s.contractSvc.close(k.contractId, c.optDate("settlementDate"))
+            s.settlementSvc.trySettleNow(k.contractId)
+            created(s.settlementLegs.find(leg.legId))
+        }
 
         post("/contracts/{contractId}/recalls") { c ->
             val k = c.loadContract()
@@ -371,23 +399,30 @@ class SblApi(private val s: SblServices) {
     // ------------------------------------------------------------------ module 4: collateral
 
     private fun RouteBuilder.collateral() {
-        // Step 3 of booking a deal: post collateral against the contract.
-        post("/contracts/{contractId}/collateral") { c ->
-            val k = c.borrowerContract()
+        // Collateral is held per counterparty and covers its whole loan book. The system values
+        // it (face value for cash/guarantees, otherwise the latest market price); no client price.
+        post("/counterparties/{id}/collateral") { c ->
+            val cp = c.accountOwner()
             val type = c.str("collateralType")
             collateralTypes.find(type) ?: throw ApiException(422, "Unknown collateralType '$type'")
-            created(s.collateralSvc.postCollateral(
-                contractId = k.contractId,
+            val position = s.collateralSvc.postCollateral(
+                counterpartyId = cp,
                 collateralType = type,
                 assetId = c.str("assetId"),
-                quantity = c.decimal("quantity").positive("quantity"),
-                unitPriceLocal = c.decimal("unitPrice").positive("unitPrice")
-            ))
+                quantity = c.decimal("quantity").positive("quantity")
+            )
+            // Collateral-first: due OPEN legs settle as soon as the account covers them (AUTO mode).
+            s.settlementSvc.trySettleForBorrower(cp)
+            created(position)
         }
 
-        get("/contracts/{contractId}/collateral") { c -> collateral.allForContract(c.loadContract().contractId) }
-        get("/contracts/{contractId}/valuation") { c -> s.collateralSvc.valuate(c.loadContract()) }
-        get("/contracts/{contractId}/mtm-history") { c -> mtmHistory.forContract(c.loadContract().contractId) }
+        get("/counterparties/{id}/collateral") { c -> collateral.allForCounterparty(c.visibleAccount()) }
+        get("/counterparties/{id}/collateral-account") { c -> s.collateralSvc.valuateAccount(c.visibleAccount()) }
+        get("/counterparties/{id}/mtm-history") { c -> mtmHistory.forCounterparty(c.visibleAccount()) }
+
+        // The contract's own requirement (negative side of its borrower's account).
+        get("/contracts/{contractId}/valuation") { c -> s.collateralSvc.requirementFor(c.loadContract()) }
+        get("/contracts/{contractId}/mtm-history") { c -> contractMtmHistory.forContract(c.loadContract().contractId) }
 
         post("/collateral/{positionId}/substitute") { c ->
             val p = c.borrowerCollateral()
@@ -397,8 +432,7 @@ class SblApi(private val s: SblServices) {
                 oldPositionId = p.positionId,
                 newType = type,
                 newAssetId = c.str("assetId"),
-                newQuantity = c.decimal("quantity").positive("quantity"),
-                newUnitPriceLocal = c.decimal("unitPrice").positive("unitPrice")
+                newQuantity = c.decimal("quantity").positive("quantity")
             ))
         }
 
@@ -410,16 +444,16 @@ class SblApi(private val s: SblServices) {
         }
 
         get("/margin-calls") { c ->
-            s.marginCalls.pending().filter { mc ->
-                c.principal.isOperator || s.contracts.find(mc.contractId)?.let { c.canSee(it.borrowerId, it.lenderId) } == true
-            }
+            s.marginCalls.pending().filter { mc -> c.canSee(mc.counterpartyId) }
         }
 
         get("/margin-calls/{callId}") { c -> c.loadMarginCall() }
 
         post("/margin-calls/{callId}/resolve", Access.OPERATOR) { c ->
             val mc = c.loadMarginCall()
-            check(mc.status == MarginCallStatus.PENDING) { "Margin call is ${mc.status}" }
+            check(mc.status == MarginCallStatus.PENDING || mc.status == MarginCallStatus.ESCALATED) {
+                "Margin call is ${mc.status}"
+            }
             s.collateralSvc.resolveMarginCall(mc.callId, c.enumOf("method"))
         }
     }
@@ -553,13 +587,38 @@ class SblApi(private val s: SblServices) {
         }
     }
 
+    // ------------------------------------------------------------------ settlement legs
+
+    private fun RouteBuilder.settlement() {
+        get("/settlement/legs", Access.OPERATOR) { c ->
+            s.settlementLegs.list(c.queryEnum<LegStatus>("status"), c.queryDate("date"))
+        }
+
+        // CCASS / custodian confirmation; idempotent when re-sent with the same externalRef.
+        post("/settlement/legs/{legId}/confirm", Access.OPERATOR) { c ->
+            val leg = s.settlementLegs.find(c.path("legId")) ?: notFound("Settlement leg")
+            s.settlementSvc.confirm(leg.legId, c.optDate("settleDate") ?: SblTime.today(), c.optStr("externalRef"))
+        }
+
+        post("/settlement/legs/{legId}/fail", Access.OPERATOR) { c ->
+            val leg = s.settlementLegs.find(c.path("legId")) ?: notFound("Settlement leg")
+            s.settlementSvc.fail(leg.legId, c.str("reason"))
+        }
+    }
+
     // ------------------------------------------------------------------ batch / end-of-day
 
     private fun RouteBuilder.operations() {
         post("/operations/eod", Access.OPERATOR) { c ->
             val date = c.optDate("date") ?: SblTime.today()
             val expired = s.locateSvc.expireLocates()
+            // Settlement runs first so accrual starts on the open-leg settle date and
+            // stops on the return-leg settle date.
+            val settlement = s.settlementSvc.settleDue(date)
             val accrued = s.feeSvc.accrueDaily(date)
+            val rebates = s.feeSvc.accrueRebates(date)
+            // Escalate calls missed before today's MTM raises any new ones.
+            val escalated = s.collateralSvc.escalateOverdueMarginCalls()
             val mtm = s.collateralSvc.runDailyMtm(date)
             val deemed = s.contractSvc.checkRegulatedPersonDeadlines()
             val overdue = s.contractSvc.checkOverdueRecalls()
@@ -567,9 +626,15 @@ class SblApi(private val s: SblServices) {
             mapOf(
                 "businessDate" to date,
                 "locatesExpired" to expired,
+                "legsSettled" to settlement.settled.map { it.legId },
+                "legsFailed" to settlement.failed.map { it.legId },
                 "feeAccruals" to accrued.size,
-                "contractsValued" to mtm.size,
+                "rebateAccruals" to rebates.size,
+                "accountsValued" to mtm.size,
+                "contractsValued" to mtm.sumOf { a -> a.contracts.count { !it.priceMissing } },
+                "mtmUnpriced" to mtm.flatMap { it.unpricedContracts },
                 "marginCalls" to mtm.mapNotNull { it.marginCall },
+                "marginCallsEscalated" to escalated.map { it.callId },
                 "deemedAcquisitions" to deemed.map { it.contractId },
                 "overdueRecalls" to overdue.map { it.recallId },
                 "buyIns" to buyIns.map { it.recallId }
@@ -577,8 +642,11 @@ class SblApi(private val s: SblServices) {
         }
 
         post("/operations/locates/expire", Access.OPERATOR) { mapOf("expired" to s.locateSvc.expireLocates()) }
+        post("/operations/settlement", Access.OPERATOR) { c -> s.settlementSvc.settleDue(c.optDate("date") ?: SblTime.today()) }
         post("/operations/fees/accrue", Access.OPERATOR) { c -> s.feeSvc.accrueDaily(c.optDate("date") ?: SblTime.today()) }
+        post("/operations/rebates/accrue", Access.OPERATOR) { c -> s.feeSvc.accrueRebates(c.optDate("date") ?: SblTime.today()) }
         post("/operations/collateral/mtm", Access.OPERATOR) { c -> s.collateralSvc.runDailyMtm(c.optDate("date") ?: SblTime.today()) }
+        post("/operations/margin-calls/escalate", Access.OPERATOR) { s.collateralSvc.escalateOverdueMarginCalls() }
         post("/operations/contracts/regulated-deadlines", Access.OPERATOR) { s.contractSvc.checkRegulatedPersonDeadlines() }
         post("/operations/recalls/overdue", Access.OPERATOR) { s.contractSvc.checkOverdueRecalls() }
         post("/operations/recalls/buy-ins", Access.OPERATOR) { s.contractSvc.escalateBuyIns() }
@@ -629,23 +697,24 @@ class SblApi(private val s: SblServices) {
         return k
     }
 
-    private fun Call.borrowerCollateral(): CollateralPosition {
-        val p = collateral.find(path("positionId")) ?: notFound("Collateral position")
-        val k = s.contracts.find(p.contractId)?.takeIf { canSee(it.borrowerId, it.lenderId, it.agentId) }
-            ?: notFound("Collateral position")
-        if (!principal.isOperator && k.borrowerId != principal.counterpartyId) {
-            forbidden("Only the borrower or an operator may do this")
-        }
-        return p
+    /** The counterparty in the path, if the caller may see it (operators, or the counterparty itself). */
+    private fun Call.visibleAccount(): String {
+        val id = path("id")
+        if (!canSee(id)) notFound("Counterparty")
+        s.counterparties.find(id) ?: notFound("Counterparty")
+        return id
     }
 
-    private fun Call.loadMarginCall(): MarginCall {
-        val mc = s.marginCalls.find(path("callId")) ?: notFound("Margin call")
-        if (!principal.isOperator) {
-            s.contracts.find(mc.contractId)?.takeIf { canSee(it.borrowerId, it.lenderId) } ?: notFound("Margin call")
-        }
-        return mc
-    }
+    /** The counterparty in the path, for acting on its collateral account. */
+    private fun Call.accountOwner(): String = actingCounterparty(visibleAccount(), "id")
+
+    /** A collateral position in an account the caller owns (or any, for operators). */
+    private fun Call.borrowerCollateral(): CollateralPosition =
+        collateral.find(path("positionId"))?.takeIf { canSee(it.counterpartyId) }
+            ?: notFound("Collateral position")
+
+    private fun Call.loadMarginCall(): MarginCall =
+        s.marginCalls.find(path("callId"))?.takeIf { canSee(it.counterpartyId) } ?: notFound("Margin call")
 
     private fun Call.loadStatement(): FeeStatement =
         statements.find(path("statementId"))?.takeIf { canSee(it.counterpartyId) } ?: notFound("Statement")

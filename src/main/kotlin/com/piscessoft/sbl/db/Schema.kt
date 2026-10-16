@@ -12,11 +12,85 @@ package com.piscessoft.sbl.db
 object Schema {
 
     fun apply(db: Database) {
+        // Collateral moved from per-contract to per-counterparty accounts: set aside the old
+        // per-contract tables so the new DDL can create the account-level ones.
+        for (t in LEGACY_COLLATERAL_TABLES) {
+            if (hasColumn(db, t, "contract_id")) {
+                check(!tableExists(db, "${t}_legacy")) { "Cannot migrate $t: ${t}_legacy already exists" }
+                db.exec("ALTER TABLE $t RENAME TO ${t}_legacy")
+            }
+        }
         stripComments(DDL).split(";")
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .forEach { db.exec(it) }
+        // Additive columns for databases created before these columns existed.
+        addColumnIfMissing(db, "sbl_contract", "book_side", "TEXT NOT NULL DEFAULT 'LOAN_OUT'")
+        addColumnIfMissing(db, "counterparty", "fee_share_pct", "TEXT")
+        addColumnIfMissing(db, "counterparty", "rebate_spread_bps", "INTEGER")
+        addColumnIfMissing(db, "fee_statement", "total_rebate_hkd", "TEXT NOT NULL DEFAULT '0'")
+        addColumnIfMissing(db, "fee_statement", "net_amount_hkd", "TEXT")
+        addColumnIfMissing(db, "designated_security", "issuer_id", "TEXT")
+        addColumnIfMissing(db, "designated_security", "currency", "TEXT NOT NULL DEFAULT 'HKD'")
+        if (addColumnIfMissing(db, "collateral_type_config", "nominal_valued", "INTEGER NOT NULL DEFAULT 0")) {
+            db.update("""UPDATE collateral_type_config SET nominal_valued=1
+                         WHERE collateral_type IN ('CASH_HKD','CASH_RMB','CASH_USD','BANK_GUAR')""")
+        }
         seed(db)
+        migrateLegacyCollateral(db)
+    }
+
+    private val LEGACY_COLLATERAL_TABLES = listOf("collateral_position", "margin_call", "collateral_mtm_history")
+
+    /**
+     * Copies per-contract collateral rows into the counterparty accounts (each contract's
+     * borrower). Idempotent; the *_legacy tables are kept for reference.
+     */
+    private fun migrateLegacyCollateral(db: Database) {
+        if (tableExists(db, "collateral_position_legacy")) db.update(
+            """INSERT INTO collateral_position (position_id,counterparty_id,collateral_type,asset_id,quantity,
+                   market_value_local,fx_rate_to_hkd,market_value_hkd,haircut_pct,adjusted_value_hkd,
+                   last_mtm_date,status,margin_call_id,created_at,updated_at)
+               SELECT p.position_id,k.borrower_id,p.collateral_type,p.asset_id,p.quantity,
+                   p.market_value_local,p.fx_rate_to_hkd,p.market_value_hkd,p.haircut_pct,p.adjusted_value_hkd,
+                   p.last_mtm_date,p.status,p.margin_call_id,p.created_at,p.updated_at
+               FROM collateral_position_legacy p JOIN sbl_contract k ON k.contract_id=p.contract_id
+               WHERE p.position_id NOT IN (SELECT position_id FROM collateral_position)""")
+        if (tableExists(db, "margin_call_legacy")) db.update(
+            """INSERT INTO margin_call (call_id,counterparty_id,call_date,borrowed_value_hkd,
+                   required_collateral_hkd,current_collateral_hkd,deficit_hkd,coverage_ratio,deadline,status,
+                   resolved_at,resolution_method,created_at)
+               SELECT m.call_id,k.borrower_id,m.call_date,m.borrowed_value_hkd,
+                   m.required_collateral_hkd,m.current_collateral_hkd,m.deficit_hkd,m.coverage_ratio,m.deadline,m.status,
+                   m.resolved_at,m.resolution_method,m.created_at
+               FROM margin_call_legacy m JOIN sbl_contract k ON k.contract_id=m.contract_id
+               WHERE m.call_id NOT IN (SELECT call_id FROM margin_call)""")
+        if (tableExists(db, "collateral_mtm_history_legacy")) db.update(
+            """INSERT INTO contract_mtm_history (history_id,contract_id,mtm_date,closing_price,
+                   borrowed_value_hkd,required_collateral_hkd,created_at)
+               SELECT h.history_id,h.contract_id,h.mtm_date,h.closing_price,
+                   h.borrowed_value_hkd,h.required_collateral_hkd,h.created_at
+               FROM collateral_mtm_history_legacy h
+               WHERE h.history_id NOT IN (SELECT history_id FROM contract_mtm_history)""")
+    }
+
+    private fun hasColumn(db: Database, table: String, column: String): Boolean =
+        db.conn.metaData.getColumns(null, null, table, null).use { rs ->
+            generateSequence { if (rs.next()) rs.getString("COLUMN_NAME") else null }
+                .any { it.equals(column, ignoreCase = true) }
+        }
+
+    private fun tableExists(db: Database, table: String): Boolean =
+        db.conn.metaData.getTables(null, null, table, null).use { rs ->
+            generateSequence { if (rs.next()) rs.getString("TABLE_NAME") else null }
+                .any { it.equals(table, ignoreCase = true) }
+        }
+
+    /** Returns true when the column was added. */
+    private fun addColumnIfMissing(db: Database, table: String, column: String, definition: String): Boolean {
+        val exists = hasColumn(db, table, column)
+        if (!exists) db.exec("ALTER TABLE $table ADD COLUMN $column $definition")
+        return !exists
     }
 
     /** Remove `--` line comments so semicolons inside comments don't split statements. */
@@ -29,21 +103,22 @@ object Schema {
     private fun seed(db: Database) {
         val count = db.queryLong("SELECT COUNT(*) FROM collateral_type_config")
         if (count > 0L) return
-        // HK-specific eligible collateral & haircuts (plan section 5.2)
+        // HK-specific eligible collateral & haircuts (plan section 5.2). Nominal-valued types
+        // (cash, guarantees) are valued at face: quantity is the amount, unit price 1.
         val rows = listOf(
-            arrayOf("CASH_HKD", "HKD cash", "HKD", "0.0000", 1, 1, null, "Full value"),
-            arrayOf("CASH_RMB", "RMB cash", "CNY", "0.0260", 1, 1, null, "HKSCC 2.6% haircut vs HKD"),
-            arrayOf("CASH_USD", "USD cash", "USD", "0.0080", 1, 1, null, "HKSCC 0.8% haircut vs HKD"),
-            arrayOf("HK_GOVT_BOND", "HK Government bonds", "HKD", "0.0200", 1, 1, "0.50", "Max 50% of total collateral"),
-            arrayOf("MARGIN_EQTY", "HKEX margin-eligible equities", "HKD", "0.2500", 1, 1, "0.30", "Max 30%; per HKEX margin list"),
-            arrayOf("BANK_GUAR", "Bank guarantee", "HKD", "0.0000", 1, 1, null, "Bilateral only")
+            arrayOf("CASH_HKD", "HKD cash", "HKD", "0.0000", 1, 1, null, 1, "Full value"),
+            arrayOf("CASH_RMB", "RMB cash", "CNY", "0.0260", 1, 1, null, 1, "HKSCC 2.6% haircut vs HKD"),
+            arrayOf("CASH_USD", "USD cash", "USD", "0.0080", 1, 1, null, 1, "HKSCC 0.8% haircut vs HKD"),
+            arrayOf("HK_GOVT_BOND", "HK Government bonds", "HKD", "0.0200", 1, 1, "0.50", 0, "Max 50% of required collateral"),
+            arrayOf("MARGIN_EQTY", "HKEX margin-eligible equities", "HKD", "0.2500", 1, 1, "0.30", 0, "Max 30% of required collateral; per HKEX margin list"),
+            arrayOf("BANK_GUAR", "Bank guarantee", "HKD", "0.0000", 1, 1, null, 1, "Bilateral only")
         )
         for (r in rows) {
             db.update(
                 """INSERT INTO collateral_type_config
                    (collateral_type, description, currency, haircut_pct, eligible_general,
-                    eligible_short_sale, max_concentration, notes)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                    eligible_short_sale, max_concentration, nominal_valued, notes)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 *r
             )
         }
@@ -59,6 +134,8 @@ object Schema {
         credit_limit_hkd    TEXT,               -- counterparty credit limit
         fee_settlement_basis TEXT NOT NULL DEFAULT 'MONTHLY', -- MONTHLY | WEEKLY | ON_CLOSE
         regulated_person    INTEGER NOT NULL DEFAULT 0,
+        fee_share_pct       TEXT,               -- share of lending fee passed to this owner when the firm lends its stock (null = global default)
+        rebate_spread_bps   INTEGER,            -- spread below the cash benchmark paid as rebate on cash collateral (null = default)
         created_at          TEXT NOT NULL
     );
 
@@ -81,7 +158,9 @@ object Schema {
         issued_shares       INTEGER NOT NULL,
         eligible            INTEGER NOT NULL DEFAULT 1,
         ca_restricted       INTEGER NOT NULL DEFAULT 0,
-        updated_at          TEXT NOT NULL
+        updated_at          TEXT NOT NULL,
+        issuer_id           TEXT,               -- groups share lines of the same issuer (wrong-way risk); NULL = stock code
+        currency            TEXT NOT NULL DEFAULT 'HKD' -- trading currency of the closing price
     );
 
     CREATE TABLE IF NOT EXISTS collateral_type_config (
@@ -91,8 +170,9 @@ object Schema {
         haircut_pct         TEXT NOT NULL,
         eligible_general    INTEGER NOT NULL DEFAULT 1,
         eligible_short_sale INTEGER NOT NULL DEFAULT 1,
-        max_concentration   TEXT,
-        notes               TEXT
+        max_concentration   TEXT,               -- max share of required collateral this type may cover
+        notes               TEXT,
+        nominal_valued      INTEGER NOT NULL DEFAULT 0  -- 1 = valued at face (cash, guarantees); 0 = needs a market price
     );
 
     CREATE TABLE IF NOT EXISTS rate_schedule (
@@ -196,9 +276,26 @@ object Schema {
         non_exempt_reason           TEXT,
         ird_category                INTEGER NOT NULL DEFAULT 0,  -- 0 = exempt; 1..4 non-exempt
         cumulative_fee_hkd          TEXT NOT NULL DEFAULT '0',
+        book_side                   TEXT NOT NULL DEFAULT 'LOAN_OUT', -- LOAN_OUT | BORROW_IN (firm borrows from the street)
         version                     INTEGER NOT NULL DEFAULT 1,
         created_at                  TEXT NOT NULL,
         updated_at                  TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS contract_allocation (
+        allocation_id       TEXT PRIMARY KEY,
+        contract_id         TEXT NOT NULL REFERENCES sbl_contract(contract_id),
+        stock_code          TEXT NOT NULL,
+        source_type         TEXT NOT NULL,      -- FIRM | CLIENT_MARGIN | THIRD_PARTY | STREET_BORROW
+        source_owner_id     TEXT NOT NULL REFERENCES counterparty(id),
+        position_id         TEXT,               -- set for inventory sources
+        source_contract_id  TEXT REFERENCES sbl_contract(contract_id), -- set for STREET_BORROW (the borrow-in)
+        quantity            INTEGER NOT NULL,
+        recalled_qty        INTEGER NOT NULL DEFAULT 0, -- portion under a recall issued because this source fell short
+        effective_from      TEXT NOT NULL,
+        effective_to        TEXT,               -- exclusive; null = current
+        created_at          TEXT NOT NULL,
+        updated_at          TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS locate_request (
@@ -265,9 +362,25 @@ object Schema {
         created_at          TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS settlement_leg (
+        leg_id               TEXT PRIMARY KEY,
+        contract_id          TEXT NOT NULL REFERENCES sbl_contract(contract_id),
+        leg_type             TEXT NOT NULL,     -- OPEN (delivery to borrower) | RETURN (redelivery to lender)
+        quantity             INTEGER NOT NULL,
+        trade_date           TEXT NOT NULL,
+        intended_settle_date TEXT NOT NULL,
+        actual_settle_date   TEXT,
+        status               TEXT NOT NULL,     -- PENDING | SETTLED | FAILED | CANCELLED
+        external_ref         TEXT UNIQUE,       -- CCASS / custodian confirmation reference
+        fail_reason          TEXT,
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL
+    );
+
+    -- Collateral account per counterparty (netting set): collateral covers the whole loan book.
     CREATE TABLE IF NOT EXISTS collateral_position (
         position_id         TEXT PRIMARY KEY,
-        contract_id         TEXT NOT NULL REFERENCES sbl_contract(contract_id),
+        counterparty_id     TEXT NOT NULL REFERENCES counterparty(id),
         collateral_type     TEXT NOT NULL REFERENCES collateral_type_config(collateral_type),
         asset_id            TEXT NOT NULL,
         quantity            TEXT NOT NULL,
@@ -285,7 +398,7 @@ object Schema {
 
     CREATE TABLE IF NOT EXISTS margin_call (
         call_id                 TEXT PRIMARY KEY,
-        contract_id             TEXT NOT NULL REFERENCES sbl_contract(contract_id),
+        counterparty_id         TEXT NOT NULL REFERENCES counterparty(id),
         call_date               TEXT NOT NULL,
         borrowed_value_hkd      TEXT NOT NULL,
         required_collateral_hkd TEXT NOT NULL,
@@ -301,14 +414,23 @@ object Schema {
 
     CREATE TABLE IF NOT EXISTS collateral_mtm_history (
         history_id              TEXT PRIMARY KEY,
-        contract_id             TEXT NOT NULL REFERENCES sbl_contract(contract_id),
+        counterparty_id         TEXT NOT NULL REFERENCES counterparty(id),
         mtm_date                TEXT NOT NULL,
         borrowed_value_hkd      TEXT NOT NULL,
         required_collateral_hkd TEXT NOT NULL,
         actual_collateral_hkd   TEXT NOT NULL,
         coverage_ratio          TEXT NOT NULL,
         margin_call_triggered   INTEGER NOT NULL DEFAULT 0,
+        created_at              TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS contract_mtm_history (
+        history_id              TEXT PRIMARY KEY,
+        contract_id             TEXT NOT NULL REFERENCES sbl_contract(contract_id),
+        mtm_date                TEXT NOT NULL,
         closing_price           TEXT NOT NULL,
+        borrowed_value_hkd      TEXT NOT NULL,
+        required_collateral_hkd TEXT NOT NULL,
         created_at              TEXT NOT NULL
     );
 
@@ -332,7 +454,7 @@ object Schema {
         split_id            TEXT PRIMARY KEY,
         accrual_id          TEXT NOT NULL REFERENCES fee_accrual(accrual_id),
         recipient_id        TEXT NOT NULL REFERENCES counterparty(id),
-        recipient_role      TEXT NOT NULL,      -- LENDER | AGENT
+        recipient_role      TEXT NOT NULL,      -- LENDER | AGENT | CLIENT_MARGIN | THIRD_PARTY
         split_pct           TEXT NOT NULL,
         split_amount_hkd    TEXT NOT NULL
     );
@@ -343,11 +465,33 @@ object Schema {
         period_from         TEXT NOT NULL,
         period_to           TEXT NOT NULL,
         total_fee_hkd       TEXT NOT NULL,
+        total_rebate_hkd    TEXT NOT NULL DEFAULT '0', -- cash-collateral rebate owed to the counterparty
+        net_amount_hkd      TEXT,               -- fee - rebate (positive = counterparty pays)
         status              TEXT NOT NULL,      -- DRAFT | SENT | AGREED | DISPUTED | SETTLED
         sent_at             TEXT,
         agreed_at           TEXT,
         dispute_reason      TEXT,
         created_at          TEXT NOT NULL
+    );
+
+    -- Daily rebate on cash collateral held in a counterparty's account (benchmark - spread).
+    CREATE TABLE IF NOT EXISTS rebate_accrual (
+        accrual_id          TEXT PRIMARY KEY,
+        counterparty_id     TEXT NOT NULL REFERENCES counterparty(id),
+        position_id         TEXT NOT NULL REFERENCES collateral_position(position_id),
+        accrual_date        TEXT NOT NULL,
+        currency            TEXT NOT NULL,
+        cash_amount         TEXT NOT NULL,      -- in [currency]
+        fx_rate_to_hkd      TEXT NOT NULL,
+        benchmark           TEXT NOT NULL,      -- HIBOR_1M | SOFR | EURIBOR ...
+        index_rate          TEXT NOT NULL,
+        spread_bps          INTEGER NOT NULL,
+        rebate_rate         TEXT NOT NULL,      -- index_rate - spread; may be negative
+        daily_rebate_hkd    TEXT NOT NULL,
+        settlement_status   TEXT NOT NULL DEFAULT 'ACCRUED', -- ACCRUED | SETTLED | DISPUTED | WAIVED
+        settlement_batch_id TEXT,
+        created_at          TEXT NOT NULL,
+        UNIQUE (position_id, accrual_date)
     );
 
     CREATE TABLE IF NOT EXISTS ca_event (
@@ -481,8 +625,15 @@ object Schema {
     CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(event_timestamp);
     CREATE INDEX IF NOT EXISTS idx_position_stock ON position(stock_code, settlement_status);
     CREATE INDEX IF NOT EXISTS idx_contract_status ON sbl_contract(status, stock_code);
+    CREATE INDEX IF NOT EXISTS idx_alloc_contract ON contract_allocation(contract_id, effective_to);
+    CREATE INDEX IF NOT EXISTS idx_alloc_position ON contract_allocation(position_id, effective_to);
+    CREATE INDEX IF NOT EXISTS idx_alloc_source_contract ON contract_allocation(source_contract_id, effective_to);
     CREATE INDEX IF NOT EXISTS idx_locate_status ON locate_request(status, stock_code);
-    CREATE INDEX IF NOT EXISTS idx_collateral_contract ON collateral_position(contract_id, status);
+    CREATE INDEX IF NOT EXISTS idx_collateral_account ON collateral_position(counterparty_id, status);
+    CREATE INDEX IF NOT EXISTS idx_margin_call_account ON margin_call(counterparty_id, status);
+    CREATE INDEX IF NOT EXISTS idx_contract_mtm ON contract_mtm_history(contract_id, mtm_date);
     CREATE INDEX IF NOT EXISTS idx_fee_contract ON fee_accrual(contract_id, settlement_status);
+    CREATE INDEX IF NOT EXISTS idx_leg_contract ON settlement_leg(contract_id, leg_type, status);
+    CREATE INDEX IF NOT EXISTS idx_leg_status ON settlement_leg(status, intended_settle_date);
     """
 }

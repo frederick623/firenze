@@ -237,7 +237,7 @@ class LocateService(
         val borrower = counterparties.find(borrowerId)
         val creditLimit = borrower?.creditLimitHkd
         if (creditLimit != null && price.signum() > 0) {
-            val onLoanExposure = contracts.active()
+            val onLoanExposure = contracts.booked()
                 .filter { it.borrowerId == borrowerId }
                 .fold(BigDecimal.ZERO) { acc, c ->
                     val p = market.latestPrice(c.stockCode, SblTime.today()) ?: BigDecimal.ZERO
@@ -257,7 +257,7 @@ class LocateService(
         // Short-interest cap: total short-sale on-loan + committed <= X% of issued shares
         val security = designated.find(stockCode)
         if (isShortSale && security != null) {
-            val existingShort = contracts.activeForStock(stockCode)
+            val existingShort = contracts.bookedForStock(stockCode)
                 .filter { it.isShortSaleBorrow }
                 .sumOf { it.quantityOutstanding }
             val committedShort = locates.committedQty(stockCode)
@@ -269,7 +269,7 @@ class LocateService(
         // Concentration cap: borrower's share of the stock's gross lendable pool
         val gross = inventory.grossLendable(stockCode)
         if (gross > 0) {
-            val borrowerOnLoan = contracts.activeForStock(stockCode)
+            val borrowerOnLoan = contracts.bookedForStock(stockCode)
                 .filter { it.borrowerId == borrowerId }
                 .sumOf { it.quantityOutstanding }
             val borrowerCommitted = locates.openCommitments()

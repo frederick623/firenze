@@ -16,6 +16,9 @@ enum class AssuranceBasis { TRADING_BOOK, TRADING_UNIT, LEGAL_ENTITY }
 
 enum class FeeType { FIXED, FLOATING, NEGOTIATED }
 
+/** Benchmark rate a FLOATING fee is priced against (index + spread). */
+enum class FloatingIndex { HIBOR_1M, HIBOR_3M, SOFR, EURIBOR }
+
 enum class AccountType(val lendable: Boolean) {
     PROPRIETARY(true),
     CLIENT_DISCRETIONARY(true),
@@ -30,6 +33,14 @@ enum class AccountType(val lendable: Boolean) {
 
 enum class SettlementStatus { SETTLED, PENDING_T1, PENDING_T2 }
 
+/** OPEN = stock delivered lender -> borrower; RETURN = stock redelivered borrower -> lender. */
+enum class LegType { OPEN, RETURN }
+
+enum class LegStatus { PENDING, SETTLED, FAILED, CANCELLED }
+
+/** AUTO = system settles due legs itself; EXTERNAL = legs settle only on CCASS/custodian confirmation. */
+enum class SettlementMode { AUTO, EXTERNAL }
+
 enum class ContractStatus {
     PENDING_CONFIRM, CONFIRMED, ACTIVE, RECALLED, RETURN_PENDING,
     PARTIALLY_RETURNED, RERATED, ROLLED_OVER, CA_ADJUSTED,
@@ -40,7 +51,19 @@ enum class TradeType { FIXED, AUCTION, NEGOTIATED }
 
 enum class TransactionModel { PRINCIPAL, AGENCY, CCP, BILATERAL, FOREIGN }
 
-enum class RecallReason { LENDER_REQUEST, CA_EVENT, LIMIT_BREACH, REGULATORY }
+enum class RecallReason {
+    LENDER_REQUEST, CA_EVENT, LIMIT_BREACH, REGULATORY,
+    /** The inventory position supplying the loan was sold/withdrawn and could not be substituted. */
+    SOURCE_SOLD,
+    /** The street borrow-in supplying the loan was recalled and could not be substituted. */
+    SOURCE_RECALLED
+}
+
+/** Which side of the book a contract sits on, from the firm's perspective. */
+enum class BookSide { LOAN_OUT, BORROW_IN }
+
+/** Where the shares delivered under a loan-out come from. */
+enum class AllocationSource { FIRM, CLIENT_MARGIN, THIRD_PARTY, STREET_BORROW }
 
 enum class RecallStatus { PENDING, PARTIALLY_RETURNED, RETURNED, OVERDUE, DEFAULTED }
 

@@ -73,7 +73,7 @@ object DemoDataSeeder {
         market.putPrice("02800", d0, Money.of("18.00"))
         market.putFx("USD", d0, Money.of("7.80"))
         market.putFx("CNY", d0, Money.of("1.07"))
-        market.putIndex("HIBOR_3M", d0, Money.of("0.045"))
+        market.putIndex(FloatingIndex.HIBOR_3M, d0, Money.of("0.045"))
 
         // Rate schedules: default 0.5%, hot-stock 00700 2%, TIER_2 floating HIBOR+200bps.
         rates.insert(RateSchedule(Ids.newId(), null, null, FeeType.FIXED, Money.of("0.005"),
@@ -81,7 +81,7 @@ object DemoDataSeeder {
         rates.insert(RateSchedule(Ids.newId(), "00700", null, FeeType.FIXED, Money.of("0.02"),
             null, null, null, d0.minusDays(30), null, priority = 10, createdAt = now))
         rates.insert(RateSchedule(Ids.newId(), null, BorrowerTier.TIER_2, FeeType.FLOATING, null,
-            "HIBOR_3M", 200, Money.of("0.01"), d0.minusDays(30), null, priority = 50, createdAt = now))
+            FloatingIndex.HIBOR_3M, 200, Money.of("0.01"), d0.minusDays(30), null, priority = 50, createdAt = now))
 
         // Lender inventory (settled, lendable).
         s.inventory.onPositionSettled("L1", "00005", AccountType.PROPRIETARY, 10_000_000)

@@ -20,9 +20,16 @@ class InventoryService(
     private val snapshots: LendablePoolSnapshotRepo,
     private val designated: DesignatedSecurityRepo,
     private val audit: AuditService,
+    private val allocations: AllocationService,
     /** Optional Schedule-3.2 inclusion of recalled (expected-back) qty in net available. */
     private val includeRecalledInPool: Boolean = false
 ) {
+
+    /**
+     * Called after a position changes so loans sourced from it can be re-sourced or recalled.
+     * Wired to [ContractService.onSourcePositionChanged] at bootstrap (avoids a constructor cycle).
+     */
+    var positionListener: ((Position) -> Unit)? = null
 
     private val lendableAccounts = setOf(
         AccountType.PROPRIETARY, AccountType.CLIENT_DISCRETIONARY, AccountType.LENDING_POOL
@@ -38,14 +45,16 @@ class InventoryService(
         val p = upsert(ownerId, stockCode, accountType, qty, settlement, source, ref)
         audit.log("POSITION", p.positionId, "POSITION_SETTLED", source, ActorType.EXTERNAL,
             newValue = "$stockCode $accountType $qty $settlement")
+        positionListener?.invoke(p)
         return p
     }
 
     /** Move quantity from a lendable account to PLEDGED (posted as collateral elsewhere). */
     fun onPositionPledged(ownerId: String, stockCode: String, qty: Long) {
-        moveBetweenAccounts(ownerId, stockCode, AccountType.PROPRIETARY, AccountType.PLEDGED, qty)
+        val src = moveBetweenAccounts(ownerId, stockCode, AccountType.PROPRIETARY, AccountType.PLEDGED, qty)
         audit.log("POSITION", "$ownerId:$stockCode", "POSITION_PLEDGED", "SETTLEMENT_SYSTEM",
             ActorType.EXTERNAL, newValue = "pledged $qty")
+        positionListener?.invoke(src)
     }
 
     /** Apply / lift a corporate-action restriction on a security (plan section 3.3). */
@@ -62,10 +71,11 @@ class InventoryService(
 
     // ---- Lendable pool computation ----
 
+    /** Settled positions in lendable accounts plus usable street borrow-ins. */
     fun grossLendable(stockCode: String): Long =
         positions.forStock(stockCode)
             .filter { it.settlementStatus == SettlementStatus.SETTLED && it.accountType in lendableAccounts }
-            .sumOf { it.quantity }
+            .sumOf { it.quantity } + allocations.borrowedInSupply(stockCode)
 
     fun recalledQty(stockCode: String): Long =
         positions.forStock(stockCode)
@@ -93,7 +103,8 @@ class InventoryService(
             qtyProprietary = sumOf(AccountType.PROPRIETARY),
             qtyClientDisc = sumOf(AccountType.CLIENT_DISCRETIONARY),
             qtyLendingPool = sumOf(AccountType.LENDING_POOL),
-            qtyRecalled = recalled
+            qtyRecalled = recalled,
+            qtyBorrowedIn = allocations.borrowedInSupply(stockCode)
         )
     }
 
@@ -124,9 +135,11 @@ class InventoryService(
 
     fun upsertDesignatedSecurity(
         stockCode: String, name: String, issuedShares: Long,
-        securityType: SecurityType = SecurityType.EQTY, eligible: Boolean = true
+        securityType: SecurityType = SecurityType.EQTY, eligible: Boolean = true,
+        issuerId: String? = null, currency: String = "HKD"
     ) = designated.upsert(
-        DesignatedSecurity(stockCode, name, securityType, issuedShares, eligible, false, SblTime.now())
+        DesignatedSecurity(stockCode, name, securityType, issuedShares, eligible, false, SblTime.now(),
+            issuerId, currency)
     )
 
     /** Daily sync: securities not present in the new HKEX list become ineligible. */
@@ -179,7 +192,7 @@ class InventoryService(
 
     private fun moveBetweenAccounts(
         ownerId: String, stockCode: String, from: AccountType, to: AccountType, qty: Long
-    ) {
+    ): Position {
         val src = positions.findKey(ownerId, stockCode, from)
             ?: error("No $from position for $ownerId/$stockCode to move")
         require(src.quantity >= qty) { "Insufficient $from qty to move ($qty > ${src.quantity})" }
@@ -187,5 +200,6 @@ class InventoryService(
         src.updatedAt = SblTime.now()
         positions.update(src)
         upsert(ownerId, stockCode, to, qty, SettlementStatus.SETTLED, src.sourceSystem, src.sourceRef)
+        return src
     }
 }

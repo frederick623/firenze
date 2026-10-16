@@ -146,9 +146,25 @@ curl -X POST localhost:8080/api/v1/locates -H "X-API-Key: $KEY" -H "Content-Type
   -d '{"stockCode":"00700","quantity":100000}'
 curl -X POST localhost:8080/api/v1/contracts -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
   -d '{"locateId":"<locateId>","lenderId":"L1"}'
-curl -X POST localhost:8080/api/v1/contracts/<contractId>/collateral -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
-  -d '{"collateralType":"CASH_HKD","assetId":"HKD","quantity":40000000,"unitPrice":1}'
+curl -X POST localhost:8080/api/v1/counterparties/B1/collateral -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"collateralType":"CASH_HKD","assetId":"HKD","quantity":40000000}'
+curl localhost:8080/api/v1/counterparties/B1/collateral-account -H "X-API-Key: $KEY"
 ```
+
+Collateral is held per counterparty account (cash perspective), not per contract. One account covers the borrower's whole book, so a surplus on one loan offsets a shortfall on another. There is at most one open margin call per account. `GET /counterparties/{id}/collateral-account` shows each collateral line, the cover by type, the requirement per contract, and the net position.
+
+Collateral rules:
+- **Valuation.** The system values collateral at face value for cash and bank guarantees, and at the latest market price otherwise. Posting is rejected if there is no price or FX rate.
+- **Eligibility.** A type eligible for no kind of borrow is rejected. A type eligible only for general or only for short-sale borrows counts only up to that kind's requirement.
+- **Concentration.** A type with `maxConcentration` counts only up to that share of the account's total requirement.
+- **Client stock.** Settled stock in the borrower's own client accounts (`CLIENT_DISCRETIONARY`, `CLIENT_NON_DISC`) is counted automatically at the `MARGIN_EQTY` haircut and cap. Internal desks are excluded.
+- **Wrong-way.** A security borrowed by the account, or any security with the same `issuerId`, cannot be pledged. Wrong-way lines that are already posted or held are excluded from cover.
+- **Settlement.** An OPEN leg settles only if the account covers its delivered contracts plus the new one. Release and substitution must keep cover for all booked contracts.
+- **Operator-only fields.** `collateralRatio` (floor 1.05 for short sales, 1.00 for general borrows) and `shortSale:false` on `POST /contracts` can only be set by an operator.
+- **Escalation.** Margin calls still PENDING after their deadline are ESCALATED by EOD (or by `POST /operations/margin-calls/escalate`).
+- **Missing prices.** Contracts with no price or FX are reported as `mtmUnpriced`. While any contract is unpriced, the account cannot release collateral and gets no margin call.
+
+Migration: on startup, any old contract-level `collateral_position`, `margin_call` and `collateral_mtm_history` tables are renamed to `*_legacy` and their rows are copied to the borrower's account. Old MTM history moves to `contract_mtm_history`. Borrow-ins from street lenders are not mirrored. Their account key is the internal desk, so that desk nets across all street lenders.
 
 | Area | Endpoints (prefix `/api/v1`) | Access |
 |---|---|---|
@@ -159,7 +175,7 @@ curl -X POST localhost:8080/api/v1/contracts/<contractId>/collateral -H "X-API-K
 | Locates | `POST/GET /locates`, `GET /locates/{id}`, `POST /locates/{id}/cancel` | any (scoped) |
 | Contracts | `POST/GET /contracts`, `GET /contracts/{id}[/events\|/recalls\|/rate-history]`, `POST /contracts/{id}/returns\|close\|recalls\|deployment` | any (scoped) |
 | Contracts (ops) | `POST /contracts/{id}/rerate\|rollover\|terminate` | operator |
-| Collateral | `POST/GET /contracts/{id}/collateral`, `GET /contracts/{id}/valuation\|mtm-history`, `POST /collateral/{positionId}/substitute\|release`, `GET /margin-calls[/{id}]`, `POST /margin-calls/{id}/resolve` | resolve: operator |
+| Collateral | `POST/GET /counterparties/{id}/collateral`, `GET /counterparties/{id}/collateral-account\|mtm-history`, `GET /contracts/{id}/valuation\|mtm-history`, `POST /collateral/{positionId}/substitute\|release`, `GET /margin-calls[/{id}]`, `POST /margin-calls/{id}/resolve` | resolve: operator |
 | Fees | `GET /contracts/{id}/accruals`, `POST /statements`, `GET /statements/{id}`, `POST /statements/{id}/send\|agree\|dispute\|settle` | create/send/settle: operator |
 | Corporate actions | `POST /corporate-actions`, `GET /corporate-actions/pending`, `POST /corporate-actions/process`, `GET /corporate-actions/{id}[/impacts]`, `POST /corporate-actions/{id}/process` | operator |
 | Reports | `POST /reports/short-positions\|sprs\|sbul1\|cap571x`, `GET /reports/lender-summary` | operator (summary: scoped) |
