@@ -67,6 +67,7 @@ object SblTests {
             testSameIssuerWrongWay()
             testUnpricedAndForeignBorrow()
             testMarginCallEscalation()
+            testPricingRevaluation()
             testFeeAccrualAndSplits()
             testRerateEffectiveDate()
             testStatementNoDoubleBilling()
@@ -283,6 +284,64 @@ object SblTests {
     }
 
     // ---- module 4 ----
+
+    /** Pricing service: stores prices and marks contracts, inventory and collateral to market. */
+    private fun testPricingRevaluation() {
+        section("Pricing: price store & MTM of contracts / inventory / collateral")
+        val c = newCtx(); SblTime.freezeAt(D0)
+        c.price("00005", "10.00")
+        val k = c.approveAndOpen("B1", "00005", 100_000)
+        c.seedSecurity("00700", 20_000_000_000, SecurityType.EQTY)
+        c.price("00700", "300.00")
+        val eq = c.collateralSvc.postCollateral("B1", "MARGIN_EQTY", "00700", BigDecimal("1000"))
+
+        val d1 = D0.plusDays(1)
+        SblTime.freezeAt(d1)
+        val rec = c.pricing.recordPrice("00005", d1, BigDecimal("12.00"), "FEED")
+        check("price stored with date and source", rec.priceDate == d1 && rec.source == "FEED")
+        check("price recording audited", c.audit.history("PRICE", "00005").any { it.eventType == "PRICE_RECORDED" })
+        c.pricing.recordPrice("00005", d1, BigDecimal("12.00"), "FEED")
+        check("re-sent price audited as correction", c.audit.history("PRICE", "00005").any { it.eventType == "PRICE_CORRECTED" })
+        check("history holds one row per date", c.pricing.priceHistory("00005", D0, d1).map { it.priceDate } == listOf(D0, d1))
+
+        val version = c.contracts.find(k)!!.version
+        val r = c.pricing.revalue(d1)
+        val kk = c.contracts.find(k)!!
+        eqBd("contract MTM = 100k x 12", kk.mtmValueHkd!!, "1200000.0000")
+        check("contract MTM price/date stored", kk.mtmPrice!!.compareTo(BigDecimal("12")) == 0 && kk.lastMtmDate == d1)
+        check("MTM does not bump the contract version", kk.version == version)
+        val inv = c.positionRepo.findKey("L1", "00005", AccountType.PROPRIETARY)!!
+        eqBd("inventory MTM = qty x 12", inv.mtmValueHkd!!, BigDecimal(inv.quantity).multiply(BigDecimal("12")).toPlainString())
+        val eqAfter = c.collateralRepo.find(eq.positionId)!!
+        eqBd("stock collateral valued on last price", eqAfter.marketValueHkd, "300000.0000")
+        check("stale collateral price reported", "00700" in r.staleInstruments && "00005" !in r.staleInstruments)
+        check("everything priced", r.unpricedInstruments.isEmpty() && r.contractsValued == 1 && r.collateralValued == 2)
+
+        // Intraday re-mark restricted to one instrument.
+        c.pricing.recordPrice("00700", d1, BigDecimal("310.00"))
+        val one = c.pricing.revalue(d1, "00700")
+        check("instrument revaluation touches only its holdings", one.contractsValued == 0 && one.collateralValued == 1)
+        eqBd("stock collateral haircut value re-marked", c.collateralRepo.find(eq.positionId)!!.adjustedValueHkd, "232500.0000")
+        check("collateral MTM date moves", c.collateralRepo.find(eq.positionId)!!.lastMtmDate == d1)
+
+        // No price: listed as unpriced, MTM left empty.
+        c.seedSecurity("09999", 1_000_000, SecurityType.EQTY)
+        c.inventory.onPositionSettled("L1", "09999", AccountType.PROPRIETARY, 1_000)
+        val r2 = c.pricing.revalue(d1)
+        check("unpriced instrument reported", r2.unpricedInstruments == listOf("09999"))
+        check("unpriced position has no MTM", c.positionRepo.findKey("L1", "09999", AccountType.PROPRIETARY)!!.mtmValueHkd == null)
+
+        // Foreign-currency instrument: price x FX.
+        c.designatedRepo.upsert(DesignatedSecurity("AAPL", "Apple", SecurityType.EQTY, 1_000_000_000,
+            updatedAt = SblTime.now(), currency = "USD"))
+        c.price("AAPL", "200.00")
+        check("no quote without FX", c.pricing.quote("AAPL", d1) == null)
+        c.market.putFx("USD", d1, BigDecimal("7.80"))
+        c.inventory.onPositionSettled("L1", "AAPL", AccountType.PROPRIETARY, 100)
+        c.pricing.revalue(d1, "AAPL")
+        eqBd("USD position MTM in HKD", c.positionRepo.findKey("L1", "AAPL", AccountType.PROPRIETARY)!!.mtmValueHkd!!, "156000.0000")
+        c.db.close()
+    }
 
     private fun testCollateralMtmAndMarginCall() {
         section("M4 MTM coverage & margin call")
@@ -1300,6 +1359,24 @@ object SblTests {
                 (call("GET", "/contracts/$contractId", b1Key).second.f("quantityOutstanding") as Number).toLong() == 60_000L)
             check("API calls are audited",
                 services.audit.history("API", "POST /api/v1/locates").any { it.actorId == "b1" })
+
+            // Pricing: EOD marked the contract; bulk load re-marks; source and history exposed.
+            check("EOD marks contract to market", (afterReturn.f("mtmValueHkd") as Number).toDouble() == 30_000_000.0)
+            check("user cannot load prices -> 403", call("POST", "/market/prices", b1Key,
+                """{"prices":[{"stockCode":"00700","price":1}]}""").first == 403)
+            check("non-positive bulk price -> 400", call("POST", "/market/prices", opKey,
+                """{"prices":[{"stockCode":"00700","price":0}]}""").first == 400)
+            val (bs, bulk) = call("POST", "/market/prices", opKey,
+                """{"source":"EOD_FEED","prices":[{"stockCode":"00700","price":"310"}],"revalue":true}""")
+            check("bulk prices stored and revalued (201)", bs == 201 && (bulk.f("stored") as Number).toInt() == 1 &&
+                (bulk.f("revaluation").f("contractsValued") as Number).toInt() == 1)
+            check("contract re-marked on 60k outstanding",
+                (call("GET", "/contracts/$contractId", b1Key).second.f("mtmValueHkd") as Number).toDouble() == 18_600_000.0)
+            check("price source exposed", call("GET", "/market/prices/00700", b1Key).second.f("source") == "EOD_FEED")
+            check("price history listed", (call("GET", "/market/prices/00700/history?from=$D0", b1Key).second as List<*>).size == 2)
+            check("quote exposes FX", (call("GET", "/market/quotes/00700", b1Key).second.f("fxRateToHkd") as Number).toInt() == 1)
+            val (rv, reval) = call("POST", "/operations/revalue", opKey, """{"stockCode":"00700"}""")
+            check("operator revaluation runs", rv == 200 && reval.f("instrumentId") == "00700")
         } finally {
             server.stop()
             c.db.close()
@@ -1323,7 +1400,7 @@ object SblTests {
         val rates = RateScheduleRepo(db)
         val positionRepo = PositionRepo(db)
         private val locateRepo = LocateRepo(db)
-        private val designatedRepo = DesignatedSecurityRepo(db)
+        val designatedRepo = DesignatedSecurityRepo(db)
         val counterpartyRepo = CounterpartyRepo(db)
         private val sblaRepo = SblaRepo(db)
         private val assuranceRepo = DocumentaryAssuranceRepo(db)
@@ -1343,9 +1420,11 @@ object SblTests {
             assuranceRepo, locate, locateRepo, inventory, legRepo, allocationSvc, audit)
             .also { svc -> inventory.positionListener = { svc.onSourcePositionChanged(it) } }
         val marginRepo = MarginCallRepo(db)
+        val pricing = PricingService(market, designatedRepo, CollateralTypeConfigRepo(db), contracts, positionRepo,
+            collateralRepo, audit)
         val collateralSvc = CollateralService(collateralRepo, marginRepo, MtmHistoryRepo(db),
             ContractMtmHistoryRepo(db), contracts, CollateralTypeConfigRepo(db), market, audit, designatedRepo,
-            positionRepo, counterpartyRepo)
+            positionRepo, counterpartyRepo, pricing = pricing)
         val settlementSvc = SettlementService(legRepo, contracts, contractSvc, collateralSvc, audit)
         val accrualRepo = FeeAccrualRepo(db)
         val feeSvc = FeeService(accrualRepo, splitRepo, FeeStatementRepo(db), contracts, market,

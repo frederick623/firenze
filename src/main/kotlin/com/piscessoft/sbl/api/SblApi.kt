@@ -189,16 +189,58 @@ class SblApi(private val s: SblServices) {
         get("/market/prices/{stockCode}") { c ->
             val code = c.path("stockCode")
             val date = c.queryDate("date") ?: SblTime.today()
-            val price = s.market.latestPrice(code, date) ?: notFound("Price")
-            mapOf("stockCode" to code, "asOf" to date, "price" to price)
+            val px = s.pricingSvc.latestPrice(code, date) ?: notFound("Price")
+            mapOf("stockCode" to code, "asOf" to date, "price" to px.closingPrice, "priceDate" to px.priceDate,
+                "source" to px.source, "stale" to px.priceDate.isBefore(date))
+        }
+
+        get("/market/prices/{stockCode}/history") { c ->
+            val to = c.queryDate("to") ?: SblTime.today()
+            val from = c.queryDate("from") ?: to.minusDays(30)
+            if (to.isBefore(from)) badRequest("'to' is before 'from'")
+            if (from.plusYears(5).isBefore(to)) badRequest("Range must not exceed 5 years")
+            s.pricingSvc.priceHistory(c.path("stockCode"), from, to)
+        }
+
+        // Price + FX used to value an instrument (stock, bond or other collateral asset).
+        get("/market/quotes/{stockCode}") { c ->
+            s.pricingSvc.quote(c.path("stockCode"), c.queryDate("date") ?: SblTime.today()) ?: notFound("Price/FX")
         }
 
         put("/market/prices/{stockCode}", Access.OPERATOR) { c ->
             val code = c.path("stockCode").also { requireId("stockCode", it) }
             val date = c.optDate("date") ?: SblTime.today()
             val price = c.decimal("price").positive("price")
-            s.market.putPrice(code, date, price)
-            mapOf("stockCode" to code, "date" to date, "price" to price)
+            val source = c.optStr("source")?.also { requireId("source", it) } ?: "API"
+            s.pricingSvc.recordPrice(code, date, price, source)
+            val out = linkedMapOf<String, Any?>("stockCode" to code, "date" to date, "price" to price, "source" to source)
+            // Optional intraday re-mark of everything holding this instrument.
+            if (c.optBool("revalue") == true) out["revaluation"] = s.pricingSvc.revalue(date, code)
+            out
+        }
+
+        // Bulk load (e.g. EOD closing prices): {"date","source","prices":[{"stockCode","price"}],"revalue"}.
+        post("/market/prices", Access.OPERATOR) { c ->
+            val date = c.optDate("date") ?: SblTime.today()
+            val source = c.optStr("source")?.also { requireId("source", it) } ?: "API"
+            val rows = c.body["prices"] as? List<*> ?: badRequest("'prices' must be an array")
+            if (rows.isEmpty() || rows.size > MAX_PRICE_ROWS) badRequest("'prices' must hold 1-$MAX_PRICE_ROWS entries")
+            val prices = linkedMapOf<String, BigDecimal>()
+            rows.forEachIndexed { i, row ->
+                val m = row as? Map<*, *> ?: badRequest("'prices[$i]' must be an object")
+                val code = (m["stockCode"] as? String)?.trim()?.also { requireId("prices[$i].stockCode", it) }
+                    ?: badRequest("'prices[$i].stockCode' is required")
+                val price = when (val v = m["price"]) {
+                    is BigDecimal -> v
+                    is String -> v.trim().toBigDecimalOrNull()
+                    else -> null
+                } ?: badRequest("'prices[$i].price' must be a number")
+                if (price.signum() <= 0) badRequest("'prices[$i].price' must be > 0")
+                if (prices.put(code, price) != null) badRequest("Duplicate stockCode '$code' in 'prices'")
+            }
+            val stored = s.pricingSvc.recordPrices(date, prices, source)
+            val revaluation = if (c.optBool("revalue") == true) s.pricingSvc.revalue(date) else null
+            created(mapOf("date" to date, "source" to source, "stored" to stored.size, "revaluation" to revaluation))
         }
 
         put("/market/fx/{currency}", Access.OPERATOR) { c ->
@@ -619,6 +661,8 @@ class SblApi(private val s: SblServices) {
             val rebates = s.feeSvc.accrueRebates(date)
             // Escalate calls missed before today's MTM raises any new ones.
             val escalated = s.collateralSvc.escalateOverdueMarginCalls()
+            // Mark contracts, inventory and collateral to today's prices before the margin run.
+            val revaluation = s.pricingSvc.revalue(date)
             val mtm = s.collateralSvc.runDailyMtm(date)
             val deemed = s.contractSvc.checkRegulatedPersonDeadlines()
             val overdue = s.contractSvc.checkOverdueRecalls()
@@ -630,6 +674,7 @@ class SblApi(private val s: SblServices) {
                 "legsFailed" to settlement.failed.map { it.legId },
                 "feeAccruals" to accrued.size,
                 "rebateAccruals" to rebates.size,
+                "revaluation" to revaluation,
                 "accountsValued" to mtm.size,
                 "contractsValued" to mtm.sumOf { a -> a.contracts.count { !it.priceMissing } },
                 "mtmUnpriced" to mtm.flatMap { it.unpricedContracts },
@@ -646,6 +691,9 @@ class SblApi(private val s: SblServices) {
         post("/operations/fees/accrue", Access.OPERATOR) { c -> s.feeSvc.accrueDaily(c.optDate("date") ?: SblTime.today()) }
         post("/operations/rebates/accrue", Access.OPERATOR) { c -> s.feeSvc.accrueRebates(c.optDate("date") ?: SblTime.today()) }
         post("/operations/collateral/mtm", Access.OPERATOR) { c -> s.collateralSvc.runDailyMtm(c.optDate("date") ?: SblTime.today()) }
+        post("/operations/revalue", Access.OPERATOR) { c ->
+            s.pricingSvc.revalue(c.optDate("date") ?: SblTime.today(), c.optStr("stockCode"))
+        }
         post("/operations/margin-calls/escalate", Access.OPERATOR) { s.collateralSvc.escalateOverdueMarginCalls() }
         post("/operations/contracts/regulated-deadlines", Access.OPERATOR) { s.contractSvc.checkRegulatedPersonDeadlines() }
         post("/operations/recalls/overdue", Access.OPERATOR) { s.contractSvc.checkOverdueRecalls() }
@@ -741,5 +789,6 @@ class SblApi(private val s: SblServices) {
         val SPRID = Regex("^[A-Za-z0-9_-]{1,32}$")
         val LEGAL_NAME = Regex("^[A-Za-z0-9][A-Za-z0-9 .&()'/-]{0,127}$")
         val FREQUENCY = Regex("^[A-Z_]{1,16}$")
+        const val MAX_PRICE_ROWS = 10_000
     }
 }

@@ -155,10 +155,31 @@ class RateScheduleRepo(private val db: Database) {
 
 /** Market data: closing prices, FX, floating index rates. */
 class MarketDataRepo(private val db: Database) {
-    fun putPrice(stockCode: String, date: java.time.LocalDate, price: BigDecimal) = db.update(
-        """INSERT INTO price_snapshot (stock_code,price_date,closing_price) VALUES (?,?,?)
-           ON CONFLICT(stock_code,price_date) DO UPDATE SET closing_price=excluded.closing_price""",
-        stockCode, SblTime.formatDate(date), Money.toDb(price)
+    fun putPrice(stockCode: String, date: java.time.LocalDate, price: BigDecimal, source: String = "MANUAL") = db.update(
+        """INSERT INTO price_snapshot (stock_code,price_date,closing_price,source,updated_at) VALUES (?,?,?,?,?)
+           ON CONFLICT(stock_code,price_date) DO UPDATE SET closing_price=excluded.closing_price,
+           source=excluded.source, updated_at=excluded.updated_at""",
+        stockCode, SblTime.formatDate(date), Money.toDb(price), source, SblTime.formatTs(SblTime.now())
+    )
+
+    /** Latest stored price record at or before [date]. */
+    fun latestPriceRecord(stockCode: String, date: java.time.LocalDate): InstrumentPrice? =
+        db.queryOne("""SELECT * FROM price_snapshot WHERE stock_code=? AND price_date<=?
+                       ORDER BY price_date DESC LIMIT 1""",
+            stockCode, SblTime.formatDate(date)) { mapPrice(it) }
+
+    /** Stored prices for [stockCode] between [from] and [to] inclusive, oldest first. */
+    fun priceHistory(stockCode: String, from: java.time.LocalDate, to: java.time.LocalDate): List<InstrumentPrice> =
+        db.query("""SELECT * FROM price_snapshot WHERE stock_code=? AND price_date>=? AND price_date<=?
+                    ORDER BY price_date""",
+            stockCode, SblTime.formatDate(from), SblTime.formatDate(to)) { mapPrice(it) }
+
+    private fun mapPrice(rs: ResultSet) = InstrumentPrice(
+        instrumentId = rs.getString("stock_code"),
+        priceDate = SblTime.parseDate(rs.getString("price_date"))!!,
+        closingPrice = BigDecimal(rs.getString("closing_price")),
+        source = rs.getString("source") ?: "MANUAL",
+        updatedAt = SblTime.parseTs(rs.getString("updated_at"))
     )
 
     fun price(stockCode: String, date: java.time.LocalDate): BigDecimal? =

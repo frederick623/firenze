@@ -32,6 +32,14 @@ object Schema {
         addColumnIfMissing(db, "fee_statement", "net_amount_hkd", "TEXT")
         addColumnIfMissing(db, "designated_security", "issuer_id", "TEXT")
         addColumnIfMissing(db, "designated_security", "currency", "TEXT NOT NULL DEFAULT 'HKD'")
+        addColumnIfMissing(db, "price_snapshot", "source", "TEXT NOT NULL DEFAULT 'MANUAL'")
+        addColumnIfMissing(db, "price_snapshot", "updated_at", "TEXT")
+        for (t in listOf("sbl_contract", "position")) {
+            addColumnIfMissing(db, t, "mtm_price", "TEXT")
+            addColumnIfMissing(db, t, "mtm_fx_rate", "TEXT")
+            addColumnIfMissing(db, t, "mtm_value_hkd", "TEXT")
+            addColumnIfMissing(db, t, "last_mtm_date", "TEXT")
+        }
         if (addColumnIfMissing(db, "collateral_type_config", "nominal_valued", "INTEGER NOT NULL DEFAULT 0")) {
             db.update("""UPDATE collateral_type_config SET nominal_valued=1
                          WHERE collateral_type IN ('CASH_HKD','CASH_RMB','CASH_USD','BANK_GUAR')""")
@@ -194,6 +202,8 @@ object Schema {
         stock_code          TEXT NOT NULL,
         price_date          TEXT NOT NULL,
         closing_price       TEXT NOT NULL,
+        source              TEXT NOT NULL DEFAULT 'MANUAL', -- feed / vendor that supplied the price
+        updated_at          TEXT,
         PRIMARY KEY (stock_code, price_date)
     );
 
@@ -277,6 +287,10 @@ object Schema {
         ird_category                INTEGER NOT NULL DEFAULT 0,  -- 0 = exempt; 1..4 non-exempt
         cumulative_fee_hkd          TEXT NOT NULL DEFAULT '0',
         book_side                   TEXT NOT NULL DEFAULT 'LOAN_OUT', -- LOAN_OUT | BORROW_IN (firm borrows from the street)
+        mtm_price                   TEXT,            -- last revaluation (PricingService)
+        mtm_fx_rate                 TEXT,
+        mtm_value_hkd               TEXT,            -- quantity_outstanding x price x fx
+        last_mtm_date               TEXT,
         version                     INTEGER NOT NULL DEFAULT 1,
         created_at                  TEXT NOT NULL,
         updated_at                  TEXT NOT NULL
@@ -601,7 +615,11 @@ object Schema {
         as_of_date          TEXT NOT NULL,
         updated_at          TEXT NOT NULL,
         source_system       TEXT NOT NULL,
-        source_ref          TEXT
+        source_ref          TEXT,
+        mtm_price           TEXT,               -- last revaluation (PricingService)
+        mtm_fx_rate         TEXT,
+        mtm_value_hkd       TEXT,               -- quantity x price x fx
+        last_mtm_date       TEXT
     );
 
     CREATE TABLE IF NOT EXISTS audit_log (
@@ -630,6 +648,7 @@ object Schema {
     CREATE INDEX IF NOT EXISTS idx_alloc_source_contract ON contract_allocation(source_contract_id, effective_to);
     CREATE INDEX IF NOT EXISTS idx_locate_status ON locate_request(status, stock_code);
     CREATE INDEX IF NOT EXISTS idx_collateral_account ON collateral_position(counterparty_id, status);
+    CREATE INDEX IF NOT EXISTS idx_collateral_asset ON collateral_position(asset_id, status);
     CREATE INDEX IF NOT EXISTS idx_margin_call_account ON margin_call(counterparty_id, status);
     CREATE INDEX IF NOT EXISTS idx_contract_mtm ON contract_mtm_history(contract_id, mtm_date);
     CREATE INDEX IF NOT EXISTS idx_fee_contract ON fee_accrual(contract_id, settlement_status);

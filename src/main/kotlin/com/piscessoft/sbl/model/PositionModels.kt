@@ -1,5 +1,6 @@
 package com.piscessoft.sbl.model
 
+import java.math.BigDecimal
 import java.time.Instant
 import java.time.LocalDate
 
@@ -14,7 +15,12 @@ data class Position(
     var asOfDate: LocalDate,
     var updatedAt: Instant,
     val sourceSystem: String,
-    val sourceRef: String? = null
+    val sourceRef: String? = null,
+    /** Last revaluation by the pricing service (null until first priced). */
+    var mtmPrice: BigDecimal? = null,
+    var mtmFxRate: BigDecimal? = null,
+    var mtmValueHkd: BigDecimal? = null,
+    var lastMtmDate: LocalDate? = null
 )
 
 /** Computed lendable-pool breakdown for a stock (plan section 3.2). */

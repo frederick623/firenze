@@ -42,7 +42,8 @@ class CollateralService(
     private val counterparties: CounterpartyRepo,
     /** Surplus above the requirement (as a share of it) before the account is flagged for release. */
     private val excessReleaseBuffer: BigDecimal = BigDecimal("0.05"),
-    private val marginCallCutoff: LocalTime = LocalTime.of(17, 0)
+    private val marginCallCutoff: LocalTime = LocalTime.of(17, 0),
+    private val pricing: PricingService = PricingService(market, securities, configs, contracts, positions, collateral, audit)
 ) {
 
     /**
@@ -96,7 +97,7 @@ class CollateralService(
         val results = mutableListOf<CollateralAccount>()
         for (cp in (books.keys + collateral.counterpartiesWithActive()).toSortedSet()) {
             val posted = collateral.activeForCounterparty(cp)
-            posted.forEach { revalueAndPersist(it, date) }
+            posted.forEach { pricing.revalueCollateral(it, date) }
             val account = valuate(cp, books[cp].orEmpty(), posted, date)
             results += account
 
@@ -290,7 +291,7 @@ class CollateralService(
     }
 
     private fun postedLine(p: CollateralPosition, date: LocalDate, book: List<SblContract>): CollateralLine {
-        val v = value(p, date)
+        val v = pricing.valueCollateral(p, date)
         val nominal = configs.find(p.collateralType)?.nominalValued ?: false
         return CollateralLine(CollateralSource.POSTED, p.positionId, p.collateralType, p.assetId, p.quantity,
             v.marketValueHkd, p.haircutPct, v.adjustedValueHkd,
@@ -339,7 +340,7 @@ class CollateralService(
             wrongWayConflict(assetId, bookedBook(counterpartyId))?.let { throw IllegalArgumentException(it) }
         }
         val date = SblTime.today()
-        val unit = unitPrice(cfg, assetId, date)
+        val unit = pricing.collateralUnitPrice(cfg, assetId, date)
             ?: throw IllegalArgumentException("No market price for $assetId on $date - cannot value $collateralType collateral")
         val fx = market.fxOrNull(cfg.currency, date)
             ?: throw IllegalArgumentException("No ${cfg.currency}/HKD rate on $date - cannot value $collateralType collateral")
@@ -366,10 +367,6 @@ class CollateralService(
         )
     }
 
-    /** Face value for nominal types (cash, guarantees); otherwise the latest market price. */
-    private fun unitPrice(cfg: CollateralTypeConfig, assetId: String, date: LocalDate): BigDecimal? =
-        if (cfg.nominalValued) BigDecimal.ONE else market.latestPrice(assetId, date)
-
     /**
      * Wrong-way risk control: a security the counterparty borrows (or another line of the
      * same issuer) cannot back its own account. Its value collapses in exactly the scenario
@@ -388,7 +385,7 @@ class CollateralService(
 
     private fun issuerOf(code: String): String = securities.find(code)?.issuerId ?: code
 
-    private fun currencyOf(stockCode: String): String = securities.find(stockCode)?.currency ?: "HKD"
+    private fun currencyOf(stockCode: String): String = pricing.currencyOf(stockCode)
 
     private fun requireCoverAfterSubstitution(old: CollateralPosition, replacement: CollateralPosition) {
         val book = bookedBook(old.counterpartyId)
@@ -408,40 +405,6 @@ class CollateralService(
     }
 
     // ---- internals ----
-
-    private class Valued(val unit: BigDecimal, val fx: BigDecimal, val marketValueLocal: BigDecimal,
-                         val marketValueHkd: BigDecimal, val adjustedValueHkd: BigDecimal)
-
-    private fun value(p: CollateralPosition, date: LocalDate): Valued {
-        val (unit, fx) = currentPricing(p, date)
-        val local = Money.money(p.quantity.multiply(unit))
-        val hkd = Money.money(local.multiply(fx))
-        return Valued(unit, fx, local, hkd, Money.money(hkd.multiply(BigDecimal.ONE.subtract(p.haircutPct))))
-    }
-
-    private fun revalueAndPersist(p: CollateralPosition, date: LocalDate) {
-        val v = value(p, date)
-        p.marketValueLocal = v.marketValueLocal
-        p.fxRateToHkd = v.fx
-        p.marketValueHkd = v.marketValueHkd
-        p.adjustedValueHkd = v.adjustedValueHkd
-        p.lastMtmDate = date
-        p.updatedAt = SblTime.now()
-        collateral.update(p)
-    }
-
-    /**
-     * Unit price and FX for revaluing a posted position: face value for nominal types,
-     * otherwise the latest market price; falls back to the last system-determined values
-     * on the position when today's price / rate is unavailable.
-     */
-    private fun currentPricing(p: CollateralPosition, date: LocalDate): Pair<BigDecimal, BigDecimal> {
-        val cfg = configs.find(p.collateralType)
-        val unit = cfg?.let { unitPrice(it, p.assetId, date) }
-            ?: if (p.quantity.signum() == 0) BigDecimal.ZERO else Money.ratio(p.marketValueLocal, p.quantity)
-        val fx = cfg?.let { market.fxOrNull(it.currency, date) } ?: p.fxRateToHkd
-        return unit to fx
-    }
 
     private fun buildMarginCall(
         counterpartyId: String, borrowed: BigDecimal, required: BigDecimal,

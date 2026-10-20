@@ -42,7 +42,12 @@ data class SblContract(
     val bookSide: BookSide = BookSide.LOAN_OUT,
     var version: Int = 1,
     val createdAt: Instant,
-    var updatedAt: Instant
+    var updatedAt: Instant,
+    /** Last revaluation by the pricing service (null until first priced). */
+    var mtmPrice: BigDecimal? = null,
+    var mtmFxRate: BigDecimal? = null,
+    var mtmValueHkd: BigDecimal? = null,
+    var lastMtmDate: LocalDate? = null
 )
 
 /**

@@ -111,6 +111,7 @@ class SblServices(
     val allocationSvc: AllocationService
     val locateSvc: LocateService
     val contractSvc: ContractService
+    val pricingSvc: PricingService
     val collateralSvc: CollateralService
     val settlementSvc: SettlementService
     val feeSvc: FeeService
@@ -148,8 +149,9 @@ class SblServices(
         contractSvc = ContractService(contracts, eventRepo, recallRepo, rateHistoryRepo, counterparties,
             assuranceRepo, locateSvc, locateRepo, inventory, settlementLegs, allocationSvc, audit)
         inventory.positionListener = { contractSvc.onSourcePositionChanged(it) }
+        pricingSvc = PricingService(market, designatedSecurities, configRepo, contracts, positionRepo, collateralRepo, audit)
         collateralSvc = CollateralService(collateralRepo, marginCalls, mtmRepo, ContractMtmHistoryRepo(db), contracts,
-            configRepo, market, audit, designatedSecurities, positionRepo, counterparties)
+            configRepo, market, audit, designatedSecurities, positionRepo, counterparties, pricing = pricingSvc)
         settlementSvc = SettlementService(settlementLegs, contracts, contractSvc, collateralSvc, audit, settlementMode)
         feeSvc = FeeService(accrualRepo, splitRepo, statementRepo, contracts, market, rateHistoryRepo, audit,
             settlementLegs, allocationSvc, RebateAccrualRepo(db), collateralRepo, configRepo, counterparties,

@@ -54,6 +54,14 @@ class ContractRepo(private val db: Database) {
     fun find(id: String): SblContract? =
         db.queryOne("SELECT * FROM sbl_contract WHERE contract_id=?", id) { map(it) }
 
+    /** Persist a revaluation. Not a business change, so the optimistic-lock version is untouched. */
+    fun updateMtm(c: SblContract) = db.update(
+        """UPDATE sbl_contract SET mtm_price=?, mtm_fx_rate=?, mtm_value_hkd=?, last_mtm_date=?
+           WHERE contract_id=?""",
+        Money.toDb(c.mtmPrice), Money.toDb(c.mtmFxRate), Money.toDb(c.mtmValueHkd),
+        SblTime.formatDate(c.lastMtmDate), c.contractId
+    )
+
     /** Contracts whose OPEN leg has settled and that still have stock on loan. */
     fun active(): List<SblContract> =
         db.query("""SELECT * FROM sbl_contract WHERE status IN
@@ -124,7 +132,11 @@ class ContractRepo(private val db: Database) {
         bookSide = BookSide.valueOf(rs.getString("book_side")),
         version = rs.getInt("version"),
         createdAt = SblTime.parseTs(rs.getString("created_at"))!!,
-        updatedAt = SblTime.parseTs(rs.getString("updated_at"))!!
+        updatedAt = SblTime.parseTs(rs.getString("updated_at"))!!,
+        mtmPrice = Money.fromDb(rs.getString("mtm_price")),
+        mtmFxRate = Money.fromDb(rs.getString("mtm_fx_rate")),
+        mtmValueHkd = Money.fromDb(rs.getString("mtm_value_hkd")),
+        lastMtmDate = SblTime.parseDate(rs.getString("last_mtm_date"))
     )
 }
 

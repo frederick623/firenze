@@ -3,6 +3,7 @@ package com.piscessoft.sbl.repo
 import com.piscessoft.sbl.db.Database
 import com.piscessoft.sbl.db.boolean
 import com.piscessoft.sbl.model.*
+import com.piscessoft.sbl.util.Money
 import com.piscessoft.sbl.util.SblTime
 import java.sql.ResultSet
 
@@ -25,6 +26,14 @@ class PositionRepo(private val db: Database) {
 
     fun find(id: String): Position? =
         db.queryOne("SELECT * FROM position WHERE position_id=?", id) { map(it) }
+
+    /** Persist a revaluation (price, FX and HKD market value) without touching quantities. */
+    fun updateMtm(p: Position) = db.update(
+        """UPDATE position SET mtm_price=?, mtm_fx_rate=?, mtm_value_hkd=?, last_mtm_date=?
+           WHERE position_id=?""",
+        Money.toDb(p.mtmPrice), Money.toDb(p.mtmFxRate), Money.toDb(p.mtmValueHkd),
+        SblTime.formatDate(p.lastMtmDate), p.positionId
+    )
 
     fun forStock(stockCode: String): List<Position> =
         db.query("SELECT * FROM position WHERE stock_code=?", stockCode) { map(it) }
@@ -53,7 +62,11 @@ class PositionRepo(private val db: Database) {
         asOfDate = SblTime.parseDate(rs.getString("as_of_date"))!!,
         updatedAt = SblTime.parseTs(rs.getString("updated_at"))!!,
         sourceSystem = rs.getString("source_system"),
-        sourceRef = rs.getString("source_ref")
+        sourceRef = rs.getString("source_ref"),
+        mtmPrice = Money.fromDb(rs.getString("mtm_price")),
+        mtmFxRate = Money.fromDb(rs.getString("mtm_fx_rate")),
+        mtmValueHkd = Money.fromDb(rs.getString("mtm_value_hkd")),
+        lastMtmDate = SblTime.parseDate(rs.getString("last_mtm_date"))
     )
 }
 

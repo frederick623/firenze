@@ -170,7 +170,7 @@ Migration: on startup, any old contract-level `collateral_position`, `margin_cal
 |---|---|---|
 | System | `GET /health`, `GET /me` | public / any |
 | Reference data | `/counterparties[/{id}[/sblas]]`, `/securities[/{stockCode}[/ca-restriction]]`, `/collateral-types`, `/rate-schedules`, `GET /rates/quote` | reads: any, writes: operator |
-| Market data | `GET /market/prices/{stockCode}`, `PUT /market/prices/{stockCode}`, `PUT /market/fx/{ccy}`, `PUT /market/indices/{index}` | writes: operator |
+| Market data | `GET /market/prices/{stockCode}[/history]`, `GET /market/quotes/{stockCode}`, `PUT /market/prices/{stockCode}`, `POST /market/prices` (bulk, optional `revalue`), `PUT /market/fx/{ccy}`, `PUT /market/indices/{index}`, `POST /operations/revalue` | writes: operator |
 | Inventory | `GET /inventory/pools/{stockCode}`, `GET /inventory/hot-stocks`, `POST /inventory/pools/{stockCode}/snapshots`, `/positions`, `POST /positions/pledges` | positions: operator |
 | Locates | `POST/GET /locates`, `GET /locates/{id}`, `POST /locates/{id}/cancel` | any (scoped) |
 | Contracts | `POST/GET /contracts`, `GET /contracts/{id}[/events\|/recalls\|/rate-history]`, `POST /contracts/{id}/returns\|close\|recalls\|deployment` | any (scoped) |
@@ -194,6 +194,7 @@ The current implementation is a **modular monolith**. Each business module is is
 | 2. Position & Inventory | Lendable pool and inventory snapshots | `InventoryService` |
 | 3. Contract Lifecycle | Open/return/recall lifecycle, status transitions, regulated-person timing, buy-in escalation | `ContractService` |
 | 4. Collateral Management | Collateral posting/substitution/release, daily MTM, margin calls | `CollateralService` |
+| 4a. Pricing | Instrument price store/history, quotes with FX, MTM of contracts, inventory positions and collateral | `PricingService` |
 | 5. Fee & Billing | Daily accruals, split allocation, fee statements and settlement | `FeeService` |
 | 6. Corporate Actions | Event ingestion and contract impact processing (dividends/splits/rights/delisting, etc.) | `CorporateActionService` |
 | 7. Regulatory Reporting | SPRS short-position reporting, IRD SBUL1 classification, Cap.571X records | `ReportingService` |

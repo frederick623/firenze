@@ -45,6 +45,12 @@ class CollateralPositionRepo(private val db: Database) {
     fun counterpartiesWithActive(): List<String> =
         db.query("SELECT DISTINCT counterparty_id FROM collateral_position WHERE status='ACTIVE'") { it.getString(1) }
 
+    /** All ACTIVE collateral, optionally restricted to one asset. */
+    fun active(assetId: String? = null): List<CollateralPosition> =
+        if (assetId == null) db.query("SELECT * FROM collateral_position WHERE status='ACTIVE' ORDER BY created_at") { map(it) }
+        else db.query("SELECT * FROM collateral_position WHERE status='ACTIVE' AND asset_id=? ORDER BY created_at",
+            assetId) { map(it) }
+
     private fun map(rs: ResultSet) = CollateralPosition(
         positionId = rs.getString("position_id"),
         counterpartyId = rs.getString("counterparty_id"),
